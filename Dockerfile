@@ -22,6 +22,8 @@ ENV LISTEN_ADDR=0.0.0.0:18080 \
     DATA_DIR=/app/data \
     SCANNER_BIN=/app/better-cloudflare-ip \
     BETTER_CF_DATA_DIR=/app/data \
+    BETTER_CF_RUN_TIMEOUT_HOURS=3 \
+    BETTER_CF_FAMILY_TIMEOUT_MINUTES=30 \
     TZ=Asia/Shanghai
 
 RUN mkdir -p /app/data

@@ -30,6 +30,7 @@ import (
 type App struct {
 	store    *Store
 	sessions *SessionStore
+	tasks    *TaskManager
 }
 
 type Store struct {
@@ -82,6 +83,11 @@ type TargetConfig struct {
 type SessionStore struct {
 	mu       sync.Mutex
 	sessions map[string]string
+}
+
+type TaskManager struct {
+	mu      sync.Mutex
+	cancels map[string]context.CancelFunc
 }
 
 type RunRecord struct {
@@ -247,6 +253,7 @@ func main() {
 	app := &App{
 		store:    store,
 		sessions: &SessionStore{sessions: make(map[string]string)},
+		tasks:    &TaskManager{cancels: make(map[string]context.CancelFunc)},
 	}
 	go app.schedulerLoop()
 
@@ -259,6 +266,8 @@ func main() {
 	mux.HandleFunc("/settings/test", app.requireAuth(app.testSettings))
 	mux.HandleFunc("/runs/start", app.requireAuth(app.startRun))
 	mux.HandleFunc("/runs/resume", app.requireAuth(app.resumeRun))
+	mux.HandleFunc("/runs/stop", app.requireAuth(app.stopRun))
+	mux.HandleFunc("/runs/delete", app.requireAuth(app.deleteRun))
 	mux.HandleFunc("/api/runs", app.requireAuth(app.runsAPI))
 	mux.HandleFunc("/run", app.requireAuth(app.runPage))
 	mux.HandleFunc("/dashboard", app.requireAuth(app.dashboard))
@@ -275,6 +284,26 @@ func envOrDefault(name, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func runTimeout() time.Duration {
+	hours := clampInt(parseInt(os.Getenv("BETTER_CF_RUN_TIMEOUT_HOURS"), 3), 1, 72)
+	return time.Duration(hours) * time.Hour
+}
+
+func familyNoResultTimeout() time.Duration {
+	minutes := clampInt(parseInt(os.Getenv("BETTER_CF_FAMILY_TIMEOUT_MINUTES"), 30), 5, 1440)
+	return time.Duration(minutes) * time.Minute
+}
+
+func formatDuration(duration time.Duration) string {
+	if duration%time.Hour == 0 {
+		return fmt.Sprintf("%d 小时", int(duration/time.Hour))
+	}
+	if duration%time.Minute == 0 {
+		return fmt.Sprintf("%d 分钟", int(duration/time.Minute))
+	}
+	return duration.String()
 }
 
 func NewStore(path string) (*Store, error) {
@@ -463,7 +492,9 @@ func (s *Store) updateRunProgress(id, stage string, progress, updatedIPs, synced
 	for i := range s.state.Runs {
 		if s.state.Runs[i].ID == id {
 			s.state.Runs[i].Stage = stage
-			s.state.Runs[i].Progress = clampInt(progress, 0, 100)
+			if progress >= 0 {
+				s.state.Runs[i].Progress = clampInt(progress, 0, 100)
+			}
 			if updatedIPs >= 0 {
 				s.state.Runs[i].UpdatedIPCount = updatedIPs
 			}
@@ -514,6 +545,53 @@ func (s *Store) finishRun(id, status, summary string) {
 			return
 		}
 	}
+}
+
+func (s *Store) cancelRun(id, summary string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.state.Runs {
+		if s.state.Runs[i].ID == id && s.state.Runs[i].Status == "running" {
+			s.state.Runs[i].Status = "canceled"
+			s.state.Runs[i].Stage = "已停止"
+			s.state.Runs[i].FinishedAt = nowString()
+			s.state.Runs[i].Summary = summary
+			s.state.Runs[i].Logs = append(s.state.Runs[i].Logs, RunLog{
+				At:      nowString(),
+				Level:   "warn",
+				Message: "任务已停止。",
+			})
+			_ = s.saveLocked()
+			return
+		}
+	}
+}
+
+func (s *Store) deleteRun(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	removed := false
+	nextRuns := s.state.Runs[:0]
+	for _, run := range s.state.Runs {
+		if run.ID == id {
+			removed = true
+			continue
+		}
+		nextRuns = append(nextRuns, run)
+	}
+	s.state.Runs = nextRuns
+	if removed {
+		nextResults := s.state.Results[:0]
+		for _, result := range s.state.Results {
+			if result.RunID == id {
+				continue
+			}
+			nextResults = append(nextResults, result)
+		}
+		s.state.Results = nextResults
+		_ = s.saveLocked()
+	}
+	return removed
 }
 
 func (s *Store) addIPResult(result IPTestResult) {
@@ -614,6 +692,29 @@ func (s *SessionStore) delete(token string) {
 	s.mu.Lock()
 	delete(s.sessions, token)
 	s.mu.Unlock()
+}
+
+func (t *TaskManager) register(id string, cancel context.CancelFunc) {
+	t.mu.Lock()
+	t.cancels[id] = cancel
+	t.mu.Unlock()
+}
+
+func (t *TaskManager) unregister(id string) {
+	t.mu.Lock()
+	delete(t.cancels, id)
+	t.mu.Unlock()
+}
+
+func (t *TaskManager) cancel(id string) bool {
+	t.mu.Lock()
+	cancel, ok := t.cancels[id]
+	t.mu.Unlock()
+	if !ok {
+		return false
+	}
+	cancel()
+	return true
 }
 
 func (a *App) root(w http.ResponseWriter, r *http.Request) {
@@ -830,6 +931,10 @@ func (a *App) startRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	state := a.store.snapshot()
+	if hasRunningRun(state.Runs) {
+		http.Redirect(w, r, "/run", http.StatusFound)
+		return
+	}
 	run, err := a.store.createRun("manual", state.Settings)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -863,6 +968,40 @@ func (a *App) resumeRun(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/run", http.StatusFound)
 }
 
+func (a *App) stopRun(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Redirect(w, r, "/run", http.StatusFound)
+		return
+	}
+	id := strings.TrimSpace(r.FormValue("id"))
+	if id == "" {
+		http.Redirect(w, r, "/run", http.StatusFound)
+		return
+	}
+	if a.tasks.cancel(id) {
+		a.store.updateRunProgress(id, "正在停止", -1, -1, -1, "pending")
+		a.store.appendRunLog(id, "warn", "收到手动停止请求，正在终止当前测速进程。")
+	} else {
+		a.store.cancelRun(id, "任务已手动停止。")
+	}
+	http.Redirect(w, r, "/run", http.StatusFound)
+}
+
+func (a *App) deleteRun(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Redirect(w, r, "/run", http.StatusFound)
+		return
+	}
+	id := strings.TrimSpace(r.FormValue("id"))
+	if id == "" {
+		http.Redirect(w, r, "/run", http.StatusFound)
+		return
+	}
+	_ = a.tasks.cancel(id)
+	a.store.deleteRun(id)
+	http.Redirect(w, r, "/run", http.StatusFound)
+}
+
 func (a *App) runsAPI(w http.ResponseWriter, r *http.Request) {
 	state := a.store.snapshot()
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -874,6 +1013,13 @@ func (a *App) executeRun(id string, settings Settings) {
 }
 
 func (a *App) executeRunWithSeed(id string, settings Settings, sourceRunID string, seed []IPTestResult) {
+	ctx, cancel := context.WithTimeout(context.Background(), runTimeout())
+	a.tasks.register(id, cancel)
+	defer func() {
+		cancel()
+		a.tasks.unregister(id)
+	}()
+
 	required := settings.IPv4Count + settings.IPv6Count
 	a.store.updateRunProgress(id, "读取配置", 5, 0, 0, "pending")
 	trigger := "manual"
@@ -881,6 +1027,7 @@ func (a *App) executeRunWithSeed(id string, settings Settings, sourceRunID strin
 		trigger = "resume"
 	}
 	a.store.appendRunLog(id, "info", "开始真实执行："+runSummary(trigger, settings))
+	a.store.appendRunLog(id, "info", fmt.Sprintf("任务保护：整体最长运行 %s；单个协议族 %s 无新增有效 IP 将自动失败。", formatDuration(runTimeout()), formatDuration(familyNoResultTimeout())))
 	if required <= 0 {
 		a.store.finishRun(id, "failed", "目标数量为 0，没有需要扫描或写入的 IP。")
 		return
@@ -909,10 +1056,10 @@ func (a *App) executeRunWithSeed(id string, settings Settings, sourceRunID strin
 		remaining := settings.IPv4Count - existingV4
 		if remaining > 0 {
 			a.store.appendRunLog(id, "info", fmt.Sprintf("开始 IPv4 扫描：还需 %d 个，总目标 %d 个。", remaining, settings.IPv4Count))
-			v4, err := a.collectFamilyResults(id, settings, 4, remaining, seen, len(results), required)
+			v4, err := a.collectFamilyResults(ctx, id, settings, 4, remaining, seen, len(results), required)
 			results = append(results, v4...)
 			if err != nil {
-				a.store.finishRun(id, "failed", err.Error())
+				a.finishRunFromError(id, err)
 				return
 			}
 		} else {
@@ -923,10 +1070,10 @@ func (a *App) executeRunWithSeed(id string, settings Settings, sourceRunID strin
 		remaining := settings.IPv6Count - existingV6
 		if remaining > 0 {
 			a.store.appendRunLog(id, "info", fmt.Sprintf("开始 IPv6 扫描：还需 %d 个，总目标 %d 个。", remaining, settings.IPv6Count))
-			v6, err := a.collectFamilyResults(id, settings, 6, remaining, seen, len(results), required)
+			v6, err := a.collectFamilyResults(ctx, id, settings, 6, remaining, seen, len(results), required)
 			results = append(results, v6...)
 			if err != nil {
-				a.store.finishRun(id, "failed", err.Error())
+				a.finishRunFromError(id, err)
 				return
 			}
 		} else {
@@ -958,6 +1105,18 @@ func (a *App) executeRunWithSeed(id string, settings Settings, sourceRunID strin
 	a.store.finishRun(id, "succeeded", fmt.Sprintf("完成：扫描 %d 个 IP，写入 Cloudflare %d 个。", len(results), synced))
 }
 
+func (a *App) finishRunFromError(id string, err error) {
+	if errors.Is(err, context.Canceled) {
+		a.store.finishRun(id, "canceled", "任务已手动停止。")
+		return
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		a.store.finishRun(id, "failed", fmt.Sprintf("任务超过整体运行上限 %s，已自动停止；请检查配置、网络或降低目标数量。", formatDuration(runTimeout())))
+		return
+	}
+	a.store.finishRun(id, "failed", err.Error())
+}
+
 func (a *App) schedulerLoop() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
@@ -975,20 +1134,38 @@ func (a *App) schedulerLoop() {
 	}
 }
 
-func (a *App) collectFamilyResults(id string, settings Settings, ipVersion, targetCount int, seen map[string]bool, existingCount, requiredCount int) ([]IPTestResult, error) {
+func (a *App) collectFamilyResults(ctx context.Context, id string, settings Settings, ipVersion, targetCount int, seen map[string]bool, existingCount, requiredCount int) ([]IPTestResult, error) {
 	results := make([]IPTestResult, 0, targetCount)
+	noResultTimeout := familyNoResultTimeout()
+	lastResultAt := time.Now()
 	for attempt := 1; len(results) < targetCount; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return results, err
+		}
 		stage := fmt.Sprintf("扫描 IPv%d %d/%d", ipVersion, len(results)+1, targetCount)
 		progress := 10 + ((existingCount + len(results)) * 65 / requiredCount)
 		a.store.updateRunProgress(id, stage, progress, existingCount+len(results), 0, "pending")
 		a.store.appendRunLog(id, "info", fmt.Sprintf("IPv%d 第 %d 次尝试，目标收集 %d/%d。", ipVersion, attempt, len(results), targetCount))
-		result, output, err := runBetterIPScan(settings, ipVersion, func(message string) {
+
+		resultDeadline := lastResultAt.Add(noResultTimeout)
+		attemptCtx, cancel := context.WithDeadline(ctx, resultDeadline)
+		result, output, err := runBetterIPScan(attemptCtx, settings, ipVersion, func(message string) {
 			a.store.appendRunLog(id, "info", message)
 		})
+		cancel()
 		if output != "" {
 			a.store.appendRunLog(id, "info", trimForLog(output, 1200))
 		}
 		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return results, ctxErr
+			}
+			if errors.Is(err, context.Canceled) {
+				return results, err
+			}
+			if errors.Is(err, context.DeadlineExceeded) || time.Now().After(resultDeadline) {
+				return results, fmt.Errorf("IPv%d 连续 %s 没有新增有效 IP，已自动停止该任务；如果 VPS 不支持 IPv%d，请把 IPv%d 数量设置为 0 后重新执行", ipVersion, formatDuration(noResultTimeout), ipVersion, ipVersion)
+			}
 			a.store.appendRunLog(id, "error", fmt.Sprintf("IPv%d 第 %d 次尝试失败：%v", ipVersion, attempt, err))
 			continue
 		}
@@ -1017,6 +1194,7 @@ func (a *App) collectFamilyResults(id string, settings Settings, ipVersion, targ
 		result.SelectedForDNS = true
 		result.TestedAt = nowString()
 		results = append(results, result)
+		lastResultAt = time.Now()
 		a.store.addIPResult(result)
 		a.store.updateRunProgress(id, stage, progress, existingCount+len(results), 0, "pending")
 		a.store.appendRunLog(id, "info", fmt.Sprintf("已保存 IPv%d 结果：%s，实测 %d Mbps，峰值 %d kB/s，RTT %d ms，机房 %s。",
@@ -1025,7 +1203,7 @@ func (a *App) collectFamilyResults(id string, settings Settings, ipVersion, targ
 	return results, nil
 }
 
-func runBetterIPScan(settings Settings, ipVersion int, onLog func(string)) (IPTestResult, string, error) {
+func runBetterIPScan(ctx context.Context, settings Settings, ipVersion int, onLog func(string)) (IPTestResult, string, error) {
 	bin, err := findScannerBinary()
 	if err != nil {
 		return IPTestResult{}, "", err
@@ -1040,7 +1218,7 @@ func runBetterIPScan(settings Settings, ipVersion int, onLog func(string)) (IPTe
 	if ipVersion == 6 && !settings.UseTLS {
 		menu = "4"
 	}
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, bin)
 	cmd.Dir = scannerWorkDir(bin)
@@ -2149,6 +2327,8 @@ const layoutTemplate = `
     input[type="text"], input[type="password"], input[type="number"], input[type="time"] { width: 100%; box-sizing: border-box; border: 1px solid #d1d5db; border-radius: 6px; padding: 10px 12px; font-size: 15px; }
     button, .button { background: #2563eb; color: white; border: 0; border-radius: 6px; padding: 10px 14px; font-size: 15px; cursor: pointer; text-decoration: none; display: inline-block; }
     button.secondary { background: #4b5563; }
+    button.danger { background: #b91c1c; }
+    button.ghost { background: #eef2f7; color: #1f2937; }
     .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; }
     .dashboard-grid { display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(280px, .8fr); gap: 18px; align-items: start; }
     .status-band { background: #102033; color: #fff; border-radius: 8px; padding: 22px; margin-bottom: 18px; }
@@ -2186,6 +2366,7 @@ const layoutTemplate = `
     .status-running { color: #b45309; }
     .status-succeeded { color: #047857; }
     .status-failed { color: #b91c1c; }
+    .status-canceled { color: #6b7280; }
     code { background: #f3f4f6; padding: 2px 5px; border-radius: 4px; }
     @media (max-width: 820px) { .dashboard-grid, .kpi-grid { grid-template-columns: 1fr; } }
   </style>
@@ -2278,6 +2459,7 @@ const dashboardTemplate = `
   <div class="row" style="margin-top:16px">
     <form action="/runs/start" method="post" style="display:inline"><button type="submit">立即执行</button></form>
     {{if .CanResumeRun}}<form action="/runs/resume" method="post" style="display:inline"><button type="submit">继续执行</button></form>{{end}}
+    {{if .CurrentRun}}<form action="/runs/stop" method="post" style="display:inline"><input type="hidden" name="id" value="{{.CurrentRun.ID}}"><button class="danger" type="submit">停止任务</button></form>{{end}}
     <a class="button" href="/run">查看日志</a>
     <a class="button" href="/settings">配置</a>
   </div>
@@ -2553,6 +2735,7 @@ const runTemplate = `
   <div class="row" style="margin-bottom:16px">
     <form action="/runs/start" method="post" style="display:inline"><button type="submit">立即执行</button></form>
     {{if .CanResumeRun}}<form action="/runs/resume" method="post" style="display:inline"><button type="submit">继续执行</button></form>{{end}}
+    {{if .CurrentRun}}<form action="/runs/stop" method="post" style="display:inline"><input type="hidden" name="id" value="{{.CurrentRun.ID}}"><button class="danger" type="submit">停止任务</button></form>{{end}}
     <a class="button" href="/settings">调整定时设置</a>
   </div>
   {{if .CurrentRun}}
@@ -2594,6 +2777,12 @@ const runsTemplate = `
           <li><span>写入 DNS</span><strong>{{.SyncedIPCount}} / {{.RequiredIPCount}}</strong></li>
           <li><span>摘要</span><strong>{{.Summary}}</strong></li>
         </ul>
+        <div class="row" style="margin:12px 0">
+          {{if eq .Status "running"}}
+            <form action="/runs/stop" method="post" style="display:inline"><input type="hidden" name="id" value="{{.ID}}"><button class="danger" type="submit">停止任务</button></form>
+          {{end}}
+          <form action="/runs/delete" method="post" style="display:inline"><input type="hidden" name="id" value="{{.ID}}"><button class="ghost" type="submit">删除记录</button></form>
+        </div>
         <pre class="log">{{range .Logs}}[{{.At}}] [{{.Level}}] {{.Message}}
 {{end}}</pre>
       </details>

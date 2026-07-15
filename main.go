@@ -500,13 +500,13 @@ func updateData() {
 // ----------------------- 工具函数 -----------------------
 
 var (
-	dataDir          string
-	randomMu         sync.Mutex
-	randomGenerator  = rand.New(rand.NewSource(time.Now().UnixNano()))
-	locationMap      map[string]location
-	locationMu       sync.RWMutex
-	speedTestDomain  string
-	speedTestFile    string
+	dataDir         string
+	randomMu        sync.Mutex
+	randomGenerator = rand.New(rand.NewSource(time.Now().UnixNano()))
+	locationMap     map[string]location
+	locationMu      sync.RWMutex
+	speedTestDomain string
+	speedTestFile   string
 )
 
 type location struct {
@@ -644,9 +644,9 @@ func downloadAllData() {
 			return
 		}
 		if err := saveToFile(urlFilename, content); err != nil {
-				fmt.Println("保存测速 URL 失败:", err)
-				return
-			}
+			fmt.Println("保存测速 URL 失败:", err)
+			return
+		}
 	}
 
 	content, err := getFileContent(urlFilename)
@@ -676,9 +676,9 @@ func downloadAllData() {
 				return
 			}
 			if err := saveToFile(fp, c); err != nil {
-					fmt.Println("保存 IP 列表失败:", err)
-					return
-				}
+				fmt.Println("保存 IP 列表失败:", err)
+				return
+			}
 		}
 	}
 
@@ -697,9 +697,9 @@ func downloadAllData() {
 			return
 		}
 		if err := saveToFile(fp, string(body)); err != nil {
-				fmt.Println("保存位置信息失败:", err)
-				return
-			}
+			fmt.Println("保存位置信息失败:", err)
+			return
+		}
 	}
 }
 
