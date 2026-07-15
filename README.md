@@ -141,7 +141,56 @@ data/app_state.json
 
 该目录包含管理员账号哈希、Cloudflare Token、任务历史和测速结果，不应该提交到 Git。
 
-## 快速开始
+## Docker Compose 启动
+
+推荐使用 Docker Compose 部署。镜像会同时编译：
+
+- `better-cloudflare-ip` 原始测速 CLI
+- `cf-betterip-web` WebUI 服务
+
+运行：
+
+```bash
+docker compose up -d --build
+```
+
+访问：
+
+```text
+http://服务器IP:18080
+```
+
+如果需要改端口：
+
+```bash
+BETTER_CF_PORT=8080 docker compose up -d --build
+```
+
+Compose 会把运行数据挂载到本地：
+
+```text
+./data:/app/data
+```
+
+这里会保存：
+
+- WebUI 管理员账号哈希
+- Cloudflare 配置
+- 任务日志
+- 测速结果
+- `better-cloudflare-ip` 下载的 IP 池和数据中心缓存
+
+`data/` 不应该提交到 Git。
+
+常用命令：
+
+```bash
+docker compose logs -f
+docker compose restart
+docker compose down
+```
+
+## 源码启动
 
 ### 1. 准备原始测速二进制
 
@@ -159,6 +208,12 @@ Web 服务会调用 `better-cloudflare-ip` 二进制进行真实测速。
 
 ```bash
 export SCANNER_BIN=/path/to/better-cloudflare-ip
+```
+
+如果希望 CLI 下载的 IP 池和位置缓存写入指定目录，可以配置：
+
+```bash
+export BETTER_CF_DATA_DIR=./data
 ```
 
 ### 2. 启动 WebUI

@@ -21,6 +21,7 @@ import (
 
 // 命令行版本的入口
 func main() {
+	dataDir = strings.TrimSpace(os.Getenv("BETTER_CF_DATA_DIR"))
 	initLocations()
 	showMenu()
 }

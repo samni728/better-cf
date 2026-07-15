@@ -1,0 +1,12 @@
+.git
+.gitignore
+.DS_Store
+memo.md
+data
+logs
+bin
+.env
+.env.*
+coverage.out
+better-cloudflare-ip
+cf-betterip-web

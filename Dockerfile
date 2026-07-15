@@ -1,0 +1,33 @@
+FROM golang:1.22-alpine AS builder
+
+WORKDIR /src
+
+COPY go.mod ./
+COPY main.go ./
+COPY cmd ./cmd
+
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/better-cloudflare-ip ./main.go \
+    && CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/cf-betterip-web ./cmd/cf-betterip-web
+
+FROM alpine:3.20
+
+RUN apk add --no-cache ca-certificates tzdata
+
+WORKDIR /app
+
+COPY --from=builder /out/better-cloudflare-ip /app/better-cloudflare-ip
+COPY --from=builder /out/cf-betterip-web /app/cf-betterip-web
+
+ENV LISTEN_ADDR=0.0.0.0:18080 \
+    DATA_DIR=/app/data \
+    SCANNER_BIN=/app/better-cloudflare-ip \
+    BETTER_CF_DATA_DIR=/app/data \
+    TZ=Asia/Shanghai
+
+RUN mkdir -p /app/data
+
+EXPOSE 18080
+
+VOLUME ["/app/data"]
+
+CMD ["/app/cf-betterip-web"]
