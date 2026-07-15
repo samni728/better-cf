@@ -148,10 +148,24 @@ data/app_state.json
 - `better-cloudflare-ip` 原始测速 CLI
 - `cf-betterip-web` WebUI 服务
 
-运行：
+推荐运行：
+
+```bash
+./scripts/docker-up.sh
+```
+
+也可以手动选择 Compose 命令。
+
+Docker Compose v2：
 
 ```bash
 docker compose up -d --build
+```
+
+Docker Compose v1：
+
+```bash
+docker-compose up -d --build
 ```
 
 访问：
@@ -164,6 +178,19 @@ http://服务器IP:18080
 
 ```bash
 BETTER_CF_PORT=8080 docker compose up -d --build
+```
+
+或复制一份环境变量示例：
+
+```bash
+cp .env.example .env
+```
+
+然后编辑 `.env`：
+
+```text
+BETTER_CF_PORT=18080
+TZ=Asia/Shanghai
 ```
 
 Compose 会把运行数据挂载到本地：
@@ -185,10 +212,14 @@ Compose 会把运行数据挂载到本地：
 常用命令：
 
 ```bash
-docker compose logs -f
-docker compose restart
-docker compose down
+./scripts/compose.sh logs -f
+./scripts/compose.sh restart
+./scripts/compose.sh down
 ```
+
+`scripts/compose.sh` 会优先使用 `docker compose`，如果系统没有 v2 插件，则自动回退到 `docker-compose` v1。
+
+注意：终端里的 `root@host:/path#` 是命令提示符，`Docker Compose version ...` 是命令输出，都不要复制进去执行。真正需要执行的只有 `docker compose ...`、`docker-compose ...` 或本项目的 `./scripts/compose.sh ...`。
 
 ## 源码启动
 

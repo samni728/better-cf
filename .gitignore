@@ -2,6 +2,7 @@
 memo.md
 .env
 .env.*
+!.env.example
 *.pem
 *.key
 
