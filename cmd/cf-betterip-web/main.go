@@ -61,6 +61,8 @@ type Settings struct {
 	DNSTargetMode        string       `json:"dns_target_mode,omitempty"`
 	IPv4Target           TargetConfig `json:"ipv4_target"`
 	IPv6Target           TargetConfig `json:"ipv6_target"`
+	IPv4Enabled          bool         `json:"ipv4_enabled"`
+	IPv6Enabled          bool         `json:"ipv6_enabled"`
 	IPv4Count            int          `json:"ipv4_count"`
 	IPv6Count            int          `json:"ipv6_count"`
 	UseTLS               bool         `json:"use_tls"`
@@ -332,6 +334,8 @@ func NewStore(path string) (*Store, error) {
 func defaultSettings() Settings {
 	return Settings{
 		DNSTargetMode:        "single",
+		IPv4Enabled:          true,
+		IPv6Enabled:          true,
 		IPv4Count:            10,
 		IPv6Count:            10,
 		UseTLS:               true,
@@ -356,11 +360,19 @@ func (s *Store) applyDefaults() {
 	if s.state.Settings.IPv6Target.CredentialMode == "" {
 		s.state.Settings.IPv6Target.CredentialMode = "shared"
 	}
-	if s.state.Settings.IPv4Count == 0 {
-		s.state.Settings.IPv4Count = 10
+	if !s.state.Settings.IPv4Enabled && s.state.Settings.IPv4Count > 0 {
+		s.state.Settings.IPv4Enabled = true
 	}
-	if s.state.Settings.IPv6Count == 0 {
-		s.state.Settings.IPv6Count = 10
+	if !s.state.Settings.IPv6Enabled && s.state.Settings.IPv6Count > 0 {
+		s.state.Settings.IPv6Enabled = true
+	}
+	s.state.Settings.IPv4Count = clampInt(s.state.Settings.IPv4Count, 0, 50)
+	s.state.Settings.IPv6Count = clampInt(s.state.Settings.IPv6Count, 0, 50)
+	if !s.state.Settings.IPv4Enabled {
+		s.state.Settings.IPv4Count = 0
+	}
+	if !s.state.Settings.IPv6Enabled {
+		s.state.Settings.IPv6Count = 0
 	}
 	if s.state.Settings.BandwidthMbps == 0 {
 		s.state.Settings.BandwidthMbps = 100
@@ -469,7 +481,7 @@ func (s *Store) createRun(trigger string, settings Settings) (RunRecord, error) 
 		Mode:            "force_refresh",
 		Stage:           "准备执行",
 		Progress:        5,
-		RequiredIPCount: settings.IPv4Count + settings.IPv6Count,
+		RequiredIPCount: requiredIPCount(settings),
 		DNSStatus:       "pending",
 		StartedAt:       nowString(),
 		Summary:         runSummary(trigger, settings),
@@ -870,8 +882,18 @@ func (a *App) settings(w http.ResponseWriter, r *http.Request) {
 		}
 		next.IPv6Target.CloudflareAccountID = strings.TrimSpace(r.FormValue("ipv6_cloudflare_account_id"))
 		next.IPv6Target.CloudflareZoneID = strings.TrimSpace(r.FormValue("ipv6_cloudflare_zone_id"))
+		next.IPv4Enabled = r.FormValue("ipv4_enabled") == "on"
+		next.IPv6Enabled = r.FormValue("ipv6_enabled") == "on"
 		next.IPv4Count = clampInt(parseInt(r.FormValue("ipv4_count"), 10), 0, 50)
 		next.IPv6Count = clampInt(parseInt(r.FormValue("ipv6_count"), 10), 0, 50)
+		if !next.IPv4Enabled || next.IPv4Count == 0 {
+			next.IPv4Enabled = false
+			next.IPv4Count = 0
+		}
+		if !next.IPv6Enabled || next.IPv6Count == 0 {
+			next.IPv6Enabled = false
+			next.IPv6Count = 0
+		}
 		next.UseTLS = r.FormValue("use_tls") == "on"
 		next.BandwidthMbps = clampInt(parseInt(r.FormValue("bandwidth_mbps"), 100), 1, 10000)
 		next.RTTConcurrency = clampInt(parseInt(r.FormValue("rtt_concurrency"), 50), 1, 100)
@@ -1020,7 +1042,7 @@ func (a *App) executeRunWithSeed(id string, settings Settings, sourceRunID strin
 		a.tasks.unregister(id)
 	}()
 
-	required := settings.IPv4Count + settings.IPv6Count
+	required := requiredIPCount(settings)
 	a.store.updateRunProgress(id, "读取配置", 5, 0, 0, "pending")
 	trigger := "manual"
 	if sourceRunID != "" {
@@ -1052,10 +1074,12 @@ func (a *App) executeRunWithSeed(id string, settings Settings, sourceRunID strin
 	}
 	existingV4 := countFamily(results, 4)
 	existingV6 := countFamily(results, 6)
-	if settings.IPv4Count > 0 {
-		remaining := settings.IPv4Count - existingV4
+	ipv4TargetCount := activeIPv4Count(settings)
+	ipv6TargetCount := activeIPv6Count(settings)
+	if ipv4TargetCount > 0 {
+		remaining := ipv4TargetCount - existingV4
 		if remaining > 0 {
-			a.store.appendRunLog(id, "info", fmt.Sprintf("开始 IPv4 扫描：还需 %d 个，总目标 %d 个。", remaining, settings.IPv4Count))
+			a.store.appendRunLog(id, "info", fmt.Sprintf("开始 IPv4 扫描：还需 %d 个，总目标 %d 个。", remaining, ipv4TargetCount))
 			v4, err := a.collectFamilyResults(ctx, id, settings, 4, remaining, seen, len(results), required)
 			results = append(results, v4...)
 			if err != nil {
@@ -1063,13 +1087,15 @@ func (a *App) executeRunWithSeed(id string, settings Settings, sourceRunID strin
 				return
 			}
 		} else {
-			a.store.appendRunLog(id, "info", fmt.Sprintf("IPv4 已满足：%d/%d。", existingV4, settings.IPv4Count))
+			a.store.appendRunLog(id, "info", fmt.Sprintf("IPv4 已满足：%d/%d。", existingV4, ipv4TargetCount))
 		}
+	} else {
+		a.store.appendRunLog(id, "info", "IPv4 未启用或数量为 0，跳过 IPv4 扫描与 A 记录同步。")
 	}
-	if settings.IPv6Count > 0 {
-		remaining := settings.IPv6Count - existingV6
+	if ipv6TargetCount > 0 {
+		remaining := ipv6TargetCount - existingV6
 		if remaining > 0 {
-			a.store.appendRunLog(id, "info", fmt.Sprintf("开始 IPv6 扫描：还需 %d 个，总目标 %d 个。", remaining, settings.IPv6Count))
+			a.store.appendRunLog(id, "info", fmt.Sprintf("开始 IPv6 扫描：还需 %d 个，总目标 %d 个。", remaining, ipv6TargetCount))
 			v6, err := a.collectFamilyResults(ctx, id, settings, 6, remaining, seen, len(results), required)
 			results = append(results, v6...)
 			if err != nil {
@@ -1077,8 +1103,10 @@ func (a *App) executeRunWithSeed(id string, settings Settings, sourceRunID strin
 				return
 			}
 		} else {
-			a.store.appendRunLog(id, "info", fmt.Sprintf("IPv6 已满足：%d/%d。", existingV6, settings.IPv6Count))
+			a.store.appendRunLog(id, "info", fmt.Sprintf("IPv6 已满足：%d/%d。", existingV6, ipv6TargetCount))
 		}
+	} else {
+		a.store.appendRunLog(id, "info", "IPv6 未启用或数量为 0，跳过 IPv6 扫描与 AAAA 记录同步。")
 	}
 
 	if len(results) != required {
@@ -1491,6 +1519,24 @@ func normalizeCredentialMode(raw string) string {
 		return "custom"
 	}
 	return "shared"
+}
+
+func activeIPv4Count(settings Settings) int {
+	if !settings.IPv4Enabled || settings.IPv4Count <= 0 {
+		return 0
+	}
+	return settings.IPv4Count
+}
+
+func activeIPv6Count(settings Settings) int {
+	if !settings.IPv6Enabled || settings.IPv6Count <= 0 {
+		return 0
+	}
+	return settings.IPv6Count
+}
+
+func requiredIPCount(settings Settings) int {
+	return activeIPv4Count(settings) + activeIPv6Count(settings)
 }
 
 func dnsTargetModeLabel(mode string) string {
@@ -1944,10 +1990,7 @@ func latestResumableRun(state AppState) (*RunRecord, []IPTestResult) {
 		if run.Status == "running" {
 			continue
 		}
-		required := run.RequiredIPCount
-		if required <= 0 {
-			required = state.Settings.IPv4Count + state.Settings.IPv6Count
-		}
+		required := requiredIPCount(state.Settings)
 		if required <= 0 {
 			continue
 		}
@@ -1963,10 +2006,12 @@ func latestResumableRun(state AppState) (*RunRecord, []IPTestResult) {
 }
 
 func seedResultsForRun(results []IPTestResult, runID string, settings Settings) []IPTestResult {
-	seed := make([]IPTestResult, 0, settings.IPv4Count+settings.IPv6Count)
+	seed := make([]IPTestResult, 0, requiredIPCount(settings))
 	seen := make(map[string]bool)
 	v4Count := 0
 	v6Count := 0
+	ipv4TargetCount := activeIPv4Count(settings)
+	ipv6TargetCount := activeIPv6Count(settings)
 	for _, result := range results {
 		if result.RunID != runID || result.IP == "" || !result.SelectedForDNS {
 			continue
@@ -1975,12 +2020,12 @@ func seedResultsForRun(results []IPTestResult, runID string, settings Settings) 
 			continue
 		}
 		if result.IPVersion == 6 {
-			if v6Count >= settings.IPv6Count {
+			if v6Count >= ipv6TargetCount {
 				continue
 			}
 			v6Count++
 		} else {
-			if v4Count >= settings.IPv4Count {
+			if v4Count >= ipv4TargetCount {
 				continue
 			}
 			v4Count++
@@ -2138,7 +2183,7 @@ func localDayStart(now time.Time) time.Time {
 
 func buildDashboardStats(state AppState) DashboardStats {
 	settings := state.Settings
-	expected := settings.IPv4Count + settings.IPv6Count
+	expected := requiredIPCount(settings)
 	stats := DashboardStats{
 		ExpectedIPCount: expected,
 		ConfigReady:     isConfigReady(settings),
@@ -2197,7 +2242,13 @@ func buildDashboardStats(state AppState) DashboardStats {
 }
 
 func isConfigReady(settings Settings) bool {
-	if effectiveRecordName(settings, "ipv4") == "" && effectiveRecordName(settings, "ipv6") == "" {
+	if requiredIPCount(settings) == 0 {
+		return false
+	}
+	if activeIPv4Count(settings) > 0 && effectiveRecordName(settings, "ipv4") == "" {
+		return false
+	}
+	if activeIPv6Count(settings) > 0 && effectiveRecordName(settings, "ipv6") == "" {
 		return false
 	}
 	if settings.CloudflareAPIToken == "" && settings.IPv4Target.CloudflareAPIToken == "" && settings.IPv6Target.CloudflareAPIToken == "" {
@@ -2207,8 +2258,14 @@ func isConfigReady(settings Settings) bool {
 }
 
 func configHint(settings Settings) string {
-	if effectiveRecordName(settings, "ipv4") == "" && effectiveRecordName(settings, "ipv6") == "" {
-		return "先配置要写入的域名"
+	if requiredIPCount(settings) == 0 {
+		return "至少启用 IPv4 或 IPv6"
+	}
+	if activeIPv4Count(settings) > 0 && effectiveRecordName(settings, "ipv4") == "" {
+		return "先配置 IPv4 目标域名"
+	}
+	if activeIPv6Count(settings) > 0 && effectiveRecordName(settings, "ipv6") == "" {
+		return "先配置 IPv6 目标域名"
 	}
 	if settings.CloudflareAPIToken == "" && settings.IPv4Target.CloudflareAPIToken == "" && settings.IPv6Target.CloudflareAPIToken == "" {
 		return "先配置 Cloudflare Token"
@@ -2235,8 +2292,8 @@ func runSummary(trigger string, settings Settings) string {
 	return fmt.Sprintf("%s / %s / IPv4:%d IPv6:%d / %d Mbps / RTT:%d",
 		triggerLabel(trigger),
 		dnsTargetModeLabel(settings.DNSTargetMode),
-		settings.IPv4Count,
-		settings.IPv6Count,
+		activeIPv4Count(settings),
+		activeIPv6Count(settings),
 		settings.BandwidthMbps,
 		settings.RTTConcurrency,
 	)
@@ -2499,8 +2556,8 @@ const dashboardTemplate = `
   <section class="panel">
     <h2>目标概览</h2>
     <ul class="compact-list">
-      <li><span>IPv4 A</span><strong>{{if .IPv4RecordName}}{{.IPv4RecordName}}{{else}}未配置{{end}}</strong></li>
-      <li><span>IPv6 AAAA</span><strong>{{if .IPv6RecordName}}{{.IPv6RecordName}}{{else}}未配置{{end}}</strong></li>
+      <li><span>IPv4 A</span><strong>{{if .Settings.IPv4Enabled}}{{if .IPv4RecordName}}{{.IPv4RecordName}}{{else}}未配置{{end}}{{else}}未启用{{end}}</strong></li>
+      <li><span>IPv6 AAAA</span><strong>{{if .Settings.IPv6Enabled}}{{if .IPv6RecordName}}{{.IPv6RecordName}}{{else}}未配置{{end}}{{else}}未启用{{end}}</strong></li>
       <li><span>计划</span><strong>{{.ScheduleSummary}}</strong></li>
       <li><span>下次</span><strong>{{.NextRunAt}}</strong></li>
       <li><span>配置</span><strong>{{if .Stats.ConfigReady}}可执行{{else}}{{.Stats.ConfigHint}}{{end}}</strong></li>
@@ -2681,10 +2738,12 @@ const settingsTemplate = `
     <h2 style="margin-top:22px">扫描参数</h2>
     <div class="grid">
       <div>
+        <label class="checkbox"><input type="checkbox" name="ipv4_enabled" {{if .Settings.IPv4Enabled}}checked{{end}}> 启用 IPv4 扫描与 A 记录同步</label>
         <label>IPv4 写入数量</label>
         <input type="number" name="ipv4_count" min="0" max="50" value="{{.Settings.IPv4Count}}">
       </div>
       <div>
+        <label class="checkbox"><input type="checkbox" name="ipv6_enabled" {{if .Settings.IPv6Enabled}}checked{{end}}> 启用 IPv6 扫描与 AAAA 记录同步</label>
         <label>IPv6 写入数量</label>
         <input type="number" name="ipv6_count" min="0" max="50" value="{{.Settings.IPv6Count}}">
       </div>

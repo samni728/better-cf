@@ -36,11 +36,15 @@ Better CF 是一个基于 `better-cloudflare-ip` 的 Cloudflare 优选 IP 自动
 
 可以在 WebUI 中配置：
 
+- 是否启用 IPv4 扫描与 A 记录同步
+- 是否启用 IPv6 扫描与 AAAA 记录同步
 - IPv4 写入数量
 - IPv6 写入数量
 - 期望带宽 Mbps
 - RTT 测试进程数
 - 是否使用 TLS
+
+如果某个协议族没有勾选启用，或者写入数量为 0，系统会跳过该协议族的扫描和 DNS 同步。例如 VPS 没有 IPv6 时，可以取消 IPv6 勾选，或把 IPv6 数量设为 0。
 
 当前执行逻辑会按任务串行收集结果，避免多个测速任务并发影响真实带宽表现。
 
