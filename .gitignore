@@ -1,0 +1,25 @@
+# Local notes and secrets
+memo.md
+.env
+.env.*
+*.pem
+*.key
+
+# Runtime state
+data/
+logs/
+bin/
+*.pid
+
+# Local build outputs
+/better-cloudflare-ip
+/cf-betterip-web
+
+# OS / editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Go
+coverage.out
