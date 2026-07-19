@@ -25,12 +25,18 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"cf-betterip-ser/internal/geodb"
 )
 
 type App struct {
-	store    *Store
-	sessions *SessionStore
-	tasks    *TaskManager
+	store        *Store
+	sessions     *SessionStore
+	tasks        *TaskManager
+	dataDir      string
+	geoMu        sync.RWMutex
+	geoLocations []geodb.Location
+	geoDatabase  GeoDatabaseStatus
 }
 
 type Store struct {
@@ -68,6 +74,10 @@ type Settings struct {
 	UseTLS               bool         `json:"use_tls"`
 	BandwidthMbps        int          `json:"bandwidth_mbps"`
 	RTTConcurrency       int          `json:"rtt_concurrency"`
+	LocationMode         string       `json:"location_mode,omitempty"`
+	LocationCountry      string       `json:"location_country,omitempty"`
+	LocationRegion       string       `json:"location_region,omitempty"`
+	LocationCity         string       `json:"location_city,omitempty"`
 	ScheduleEnabled      bool         `json:"schedule_enabled"`
 	ScheduleMode         string       `json:"schedule_mode,omitempty"`
 	ScheduleIntervalDays int          `json:"schedule_interval_days"`
@@ -126,6 +136,10 @@ type IPTestResult struct {
 	PeakSpeedKBps           int    `json:"peak_speed_kbps"`
 	RTTMs                   int    `json:"rtt_ms"`
 	DataCenter              string `json:"data_center"`
+	DataCenterCode          string `json:"data_center_code,omitempty"`
+	DataCenterCountry       string `json:"data_center_country,omitempty"`
+	DataCenterRegion        string `json:"data_center_region,omitempty"`
+	DataCenterCity          string `json:"data_center_city,omitempty"`
 	DurationSeconds         int    `json:"duration_seconds"`
 	SelectedForDNS          bool   `json:"selected_for_dns"`
 	CloudflareSynced        bool   `json:"cloudflare_synced"`
@@ -148,6 +162,7 @@ type PageData struct {
 	IPv4TokenMasked     string
 	IPv6TokenMasked     string
 	ScheduleSummary     string
+	LocationSummary     string
 	NextRunAt           string
 	RecentRuns          []RunRecord
 	HasRunningRun       bool
@@ -162,6 +177,33 @@ type PageData struct {
 	TodayResultSummary  IPResultSummary
 	TodayIPv4Results    []IPResultView
 	TodayIPv6Results    []IPResultView
+	GeoCountries        []GeoChoice
+	GeoRegions          []GeoChoice
+	GeoCities           []GeoChoice
+	GeoLocations        []geodb.Location
+	GeoDatabase         GeoDatabaseStatus
+}
+
+type GeoLocation struct {
+	IATA    string  `json:"iata"`
+	Lat     float64 `json:"lat"`
+	Lon     float64 `json:"lon"`
+	Country string  `json:"cca2"`
+	Region  string  `json:"region"`
+	City    string  `json:"city"`
+}
+
+type GeoChoice struct {
+	Value    string
+	Label    string
+	Selected bool
+}
+
+type GeoDatabaseStatus struct {
+	LocationCount int
+	GeoFeedCount  int
+	UpdatedAt     string
+	Ready         bool
 }
 
 type DashboardStats struct {
@@ -204,6 +246,9 @@ type IPResultView struct {
 	PeakSpeedKBps           int
 	RTTMs                   int
 	DataCenter              string
+	DataCenterCode          string
+	DataCenterCountry       string
+	DataCenterRegion        string
 	DurationSeconds         int
 	SyncedText              string
 	TestedAt                string
@@ -252,10 +297,15 @@ func main() {
 		log.Fatal(err)
 	}
 
+	dataCenterLocations := loadGeoLocations(*dataDir)
+	geoEntries := loadGeoDatabase(*dataDir)
 	app := &App{
-		store:    store,
-		sessions: &SessionStore{sessions: make(map[string]string)},
-		tasks:    &TaskManager{cancels: make(map[string]context.CancelFunc)},
+		store:        store,
+		sessions:     &SessionStore{sessions: make(map[string]string)},
+		tasks:        &TaskManager{cancels: make(map[string]context.CancelFunc)},
+		dataDir:      *dataDir,
+		geoLocations: geodb.Locations(geoEntries),
+		geoDatabase:  readGeoDatabaseStatus(*dataDir, len(dataCenterLocations)),
 	}
 	go app.schedulerLoop()
 
@@ -266,6 +316,7 @@ func main() {
 	mux.HandleFunc("/logout", app.logout)
 	mux.HandleFunc("/settings", app.requireAuth(app.settings))
 	mux.HandleFunc("/settings/test", app.requireAuth(app.testSettings))
+	mux.HandleFunc("/settings/geo-refresh", app.requireAuth(app.refreshGeoDatabase))
 	mux.HandleFunc("/runs/start", app.requireAuth(app.startRun))
 	mux.HandleFunc("/runs/resume", app.requireAuth(app.resumeRun))
 	mux.HandleFunc("/runs/stop", app.requireAuth(app.stopRun))
@@ -286,6 +337,238 @@ func envOrDefault(name, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+const (
+	locationsSourceURL   = "https://www.baipiao.eu.org/cloudflare/locations"
+	cloudflareGeoFeedURL = "https://api.cloudflare.com/local-ip-ranges.csv"
+)
+
+func loadGeoLocations(dataDir string) []GeoLocation {
+	path := filepath.Join(dataDir, "locations.json")
+	if data, err := os.ReadFile(path); err == nil {
+		if locations := parseGeoLocations(data); len(locations) > 0 {
+			return locations
+		}
+	}
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Get(locationsSourceURL)
+	if err != nil {
+		log.Printf("load location options failed: %v", err)
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		log.Printf("load location options failed: HTTP %d", resp.StatusCode)
+		return nil
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 8*1024*1024))
+	if err != nil {
+		log.Printf("read location options failed: %v", err)
+		return nil
+	}
+	locations := parseGeoLocations(data)
+	if len(locations) == 0 {
+		log.Printf("load location options failed: response contains no valid locations")
+		return nil
+	}
+	if err := os.MkdirAll(dataDir, 0755); err == nil {
+		if err := atomicWriteFile(path, data); err != nil {
+			log.Printf("cache location options failed: %v", err)
+		}
+	}
+	return locations
+}
+
+func parseGeoLocations(data []byte) []GeoLocation {
+	var locations []GeoLocation
+	if err := json.Unmarshal(data, &locations); err != nil {
+		return nil
+	}
+	result := locations[:0]
+	for _, loc := range locations {
+		loc.IATA = strings.ToUpper(strings.TrimSpace(loc.IATA))
+		loc.Country = strings.ToUpper(strings.TrimSpace(loc.Country))
+		loc.Region = strings.TrimSpace(loc.Region)
+		loc.City = strings.TrimSpace(loc.City)
+		if loc.IATA == "" || loc.Country == "" || loc.City == "" {
+			continue
+		}
+		result = append(result, loc)
+	}
+	return result
+}
+
+func validateGeoFeed(data []byte) (int, error) {
+	entries, err := geodb.Parse(bytes.NewReader(data))
+	if err != nil {
+		return 0, fmt.Errorf("解析 GeoFeed 失败: %w", err)
+	}
+	count := len(entries)
+	if count < 1000 {
+		return 0, fmt.Errorf("GeoFeed 记录数异常: %d", count)
+	}
+	return count, nil
+}
+
+func loadGeoDatabase(dataDir string) []geodb.Entry {
+	path := filepath.Join(dataDir, "local-ip-ranges.csv")
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		seedCandidates := []string{
+			strings.TrimSpace(os.Getenv("BETTER_CF_GEO_DB_SEED")),
+			filepath.Join("database", "local-ip-ranges.csv"),
+		}
+		for _, seedPath := range seedCandidates {
+			if seedPath == "" {
+				continue
+			}
+			seed, readErr := os.ReadFile(seedPath)
+			if readErr != nil {
+				continue
+			}
+			if _, validateErr := validateGeoFeed(seed); validateErr != nil {
+				log.Printf("ignore invalid GeoFeed seed %s: %v", seedPath, validateErr)
+				continue
+			}
+			if writeErr := atomicWriteFile(path, seed); writeErr != nil {
+				log.Printf("seed GeoFeed database failed: %v", writeErr)
+			} else {
+				log.Printf("seeded GeoFeed database from %s", seedPath)
+			}
+			break
+		}
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer file.Close()
+	entries, err := geodb.Parse(file)
+	if err != nil {
+		log.Printf("load GeoFeed database failed: %v", err)
+		return nil
+	}
+	return entries
+}
+
+func downloadData(client *http.Client, sourceURL string, maxBytes int64) ([]byte, error) {
+	resp, err := client.Get(sourceURL)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, fmt.Errorf("下载内容超过 %d 字节上限", maxBytes)
+	}
+	return data, nil
+}
+
+func atomicWriteFile(path string, data []byte) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".geo-update-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	ok := false
+	defer func() {
+		tmp.Close()
+		if !ok {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if _, err := tmp.Write(data); err != nil {
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		return err
+	}
+	if err := tmp.Chmod(0644); err != nil {
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return err
+	}
+	ok = true
+	return nil
+}
+
+func readGeoDatabaseStatus(dataDir string, locationCount int) GeoDatabaseStatus {
+	status := GeoDatabaseStatus{LocationCount: locationCount}
+	path := filepath.Join(dataDir, "local-ip-ranges.csv")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return status
+	}
+	count, err := validateGeoFeed(data)
+	if err != nil {
+		return status
+	}
+	status.GeoFeedCount = count
+	status.Ready = count > 0
+	if info, err := os.Stat(path); err == nil {
+		status.UpdatedAt = info.ModTime().Format("2006-01-02 15:04:05")
+	}
+	return status
+}
+
+func (a *App) geoSnapshot() ([]geodb.Location, GeoDatabaseStatus) {
+	a.geoMu.RLock()
+	defer a.geoMu.RUnlock()
+	locations := append([]geodb.Location(nil), a.geoLocations...)
+	return locations, a.geoDatabase
+}
+
+func (a *App) updateGeoDatabase() (GeoDatabaseStatus, error) {
+	client := &http.Client{Timeout: 45 * time.Second}
+	geoFeedData, err := downloadData(client, cloudflareGeoFeedURL, 16*1024*1024)
+	if err != nil {
+		return GeoDatabaseStatus{}, fmt.Errorf("下载 Cloudflare GeoFeed 失败: %w", err)
+	}
+	geoFeedCount, err := validateGeoFeed(geoFeedData)
+	if err != nil {
+		return GeoDatabaseStatus{}, err
+	}
+	geoEntries, err := geodb.Parse(bytes.NewReader(geoFeedData))
+	if err != nil {
+		return GeoDatabaseStatus{}, fmt.Errorf("解析 GeoFeed 失败: %w", err)
+	}
+	if err := atomicWriteFile(filepath.Join(a.dataDir, "local-ip-ranges.csv"), geoFeedData); err != nil {
+		return GeoDatabaseStatus{}, fmt.Errorf("更新 GeoFeed 失败: %w", err)
+	}
+	_, currentStatus := a.geoSnapshot()
+	locationCount := currentStatus.LocationCount
+	if locationsData, downloadErr := downloadData(client, locationsSourceURL, 8*1024*1024); downloadErr == nil {
+		if locations := parseGeoLocations(locationsData); len(locations) >= 100 {
+			if writeErr := atomicWriteFile(filepath.Join(a.dataDir, "locations.json"), locationsData); writeErr == nil {
+				locationCount = len(locations)
+			}
+		}
+	}
+	status := GeoDatabaseStatus{
+		LocationCount: locationCount,
+		GeoFeedCount:  geoFeedCount,
+		UpdatedAt:     time.Now().Format("2006-01-02 15:04:05"),
+		Ready:         true,
+	}
+	a.geoMu.Lock()
+	a.geoLocations = geodb.Locations(geoEntries)
+	a.geoDatabase = status
+	a.geoMu.Unlock()
+	return status, nil
 }
 
 func runTimeout() time.Duration {
@@ -341,6 +624,7 @@ func defaultSettings() Settings {
 		UseTLS:               true,
 		BandwidthMbps:        100,
 		RTTConcurrency:       50,
+		LocationMode:         "any",
 		ScheduleMode:         "daily",
 		ScheduleIntervalDays: 1,
 		ScheduleTime:         "06:00",
@@ -379,6 +663,13 @@ func (s *Store) applyDefaults() {
 	}
 	if s.state.Settings.RTTConcurrency == 0 {
 		s.state.Settings.RTTConcurrency = 50
+	}
+	s.state.Settings.LocationMode = normalizeLocationMode(s.state.Settings.LocationMode)
+	s.state.Settings.LocationCountry = strings.ToUpper(strings.TrimSpace(s.state.Settings.LocationCountry))
+	s.state.Settings.LocationRegion = strings.TrimSpace(s.state.Settings.LocationRegion)
+	s.state.Settings.LocationCity = strings.TrimSpace(s.state.Settings.LocationCity)
+	if s.state.Settings.LocationCountry == "" && s.state.Settings.LocationRegion == "" && s.state.Settings.LocationCity == "" {
+		s.state.Settings.LocationMode = "any"
 	}
 	if s.state.Settings.ScheduleMode == "" {
 		s.state.Settings.ScheduleMode = "daily"
@@ -838,7 +1129,8 @@ func (a *App) dashboard(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) pageData(title, username string, settings Settings) PageData {
-	return PageData{
+	geoLocations, geoDatabase := a.geoSnapshot()
+	data := PageData{
 		Title:               title,
 		Username:            username,
 		Settings:            settings,
@@ -851,8 +1143,68 @@ func (a *App) pageData(title, username string, settings Settings) PageData {
 		IPv4TokenMasked:     maskToken(effectiveToken(settings, settings.IPv4Target)),
 		IPv6TokenMasked:     maskToken(effectiveToken(settings, settings.IPv6Target)),
 		ScheduleSummary:     scheduleSummary(settings),
+		LocationSummary:     locationFilterSummary(settings),
 		NextRunAt:           nextRunText(settings),
+		GeoLocations:        geoLocations,
+		GeoDatabase:         geoDatabase,
 	}
+	data.GeoCountries, data.GeoRegions, data.GeoCities = buildGeoChoices(geoLocations, settings)
+	return data
+}
+
+func (a *App) refreshGeoDatabase(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	state := a.store.snapshot()
+	user, _ := a.currentUser(r)
+	status, err := a.updateGeoDatabase()
+	data := a.pageData("配置", user, state.Settings)
+	if err != nil {
+		data.Error = "地区数据库更新失败：" + err.Error()
+	} else {
+		data.Flash = fmt.Sprintf("地区数据库已更新：%d 个机房，%d 条 Cloudflare IP 地理记录。", status.LocationCount, status.GeoFeedCount)
+	}
+	a.render(w, settingsTemplate, data)
+}
+
+func buildGeoChoices(locations []geodb.Location, settings Settings) ([]GeoChoice, []GeoChoice, []GeoChoice) {
+	countries := make(map[string]bool)
+	regions := make(map[string]bool)
+	cities := make(map[string]bool)
+	for _, loc := range locations {
+		countries[loc.Country] = true
+		if settings.LocationCountry != "" && !strings.EqualFold(settings.LocationCountry, loc.Country) {
+			continue
+		}
+		if loc.Region != "" {
+			regions[loc.Region] = true
+		}
+		if settings.LocationRegion != "" && !strings.EqualFold(settings.LocationRegion, loc.Region) {
+			continue
+		}
+		if loc.City != "" {
+			cities[loc.City] = true
+		}
+	}
+	return geoChoices(countries, settings.LocationCountry), geoChoices(regions, settings.LocationRegion), geoChoices(cities, settings.LocationCity)
+}
+
+func geoChoices(values map[string]bool, selected string) []GeoChoice {
+	if strings.TrimSpace(selected) != "" {
+		values[selected] = true
+	}
+	keys := make([]string, 0, len(values))
+	for value := range values {
+		keys = append(keys, value)
+	}
+	sort.Slice(keys, func(i, j int) bool { return strings.ToLower(keys[i]) < strings.ToLower(keys[j]) })
+	choices := make([]GeoChoice, 0, len(keys))
+	for _, value := range keys {
+		choices = append(choices, GeoChoice{Value: value, Label: value, Selected: strings.EqualFold(value, selected)})
+	}
+	return choices
 }
 
 func (a *App) settings(w http.ResponseWriter, r *http.Request) {
@@ -897,6 +1249,13 @@ func (a *App) settings(w http.ResponseWriter, r *http.Request) {
 		next.UseTLS = r.FormValue("use_tls") == "on"
 		next.BandwidthMbps = clampInt(parseInt(r.FormValue("bandwidth_mbps"), 100), 1, 10000)
 		next.RTTConcurrency = clampInt(parseInt(r.FormValue("rtt_concurrency"), 50), 1, 100)
+		next.LocationMode = normalizeLocationMode(r.FormValue("location_mode"))
+		next.LocationCountry = strings.ToUpper(strings.TrimSpace(r.FormValue("location_country")))
+		next.LocationRegion = strings.TrimSpace(r.FormValue("location_region"))
+		next.LocationCity = strings.TrimSpace(r.FormValue("location_city"))
+		if next.LocationCountry == "" && next.LocationRegion == "" && next.LocationCity == "" {
+			next.LocationMode = "any"
+		}
 		next.ScheduleEnabled = r.FormValue("schedule_enabled") == "on"
 		next.ScheduleMode = normalizeScheduleMode(r.FormValue("schedule_mode"))
 		next.ScheduleIntervalDays = clampInt(parseInt(r.FormValue("schedule_interval_days"), 1), 1, 365)
@@ -1250,6 +1609,12 @@ func runBetterIPScan(ctx context.Context, settings Settings, ipVersion int, onLo
 	defer cancel()
 	cmd := exec.CommandContext(ctx, bin)
 	cmd.Dir = scannerWorkDir(bin)
+	cmd.Env = append(os.Environ(),
+		"BETTER_CF_LOCATION_MODE="+normalizeLocationMode(settings.LocationMode),
+		"BETTER_CF_LOCATION_COUNTRY="+strings.TrimSpace(settings.LocationCountry),
+		"BETTER_CF_LOCATION_REGION="+strings.TrimSpace(settings.LocationRegion),
+		"BETTER_CF_LOCATION_CITY="+strings.TrimSpace(settings.LocationCity),
+	)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return IPTestResult{}, "", err
@@ -1419,6 +1784,10 @@ func parseBetterIPOutput(output string) (IPTestResult, error) {
 	result.PeakSpeedKBps = atoi(firstMatch(output, `峰值速度:\s*(\d+)\s*kB/s`))
 	result.RTTMs = atoi(firstMatch(output, `往返延迟:\s*(\d+)\s*毫秒`))
 	result.DataCenter = strings.TrimSpace(firstMatch(output, `数据中心:\s*([^\n\r]+)`))
+	result.DataCenterCode = strings.TrimSpace(firstMatch(output, `数据中心代码:\s*([^\n\r]+)`))
+	result.DataCenterCountry = strings.TrimSpace(firstMatch(output, `数据中心国家:\s*([^\n\r]+)`))
+	result.DataCenterRegion = strings.TrimSpace(firstMatch(output, `数据中心区域:\s*([^\n\r]+)`))
+	result.DataCenterCity = strings.TrimSpace(firstMatch(output, `数据中心城市:\s*([^\n\r]+)`))
 	result.DurationSeconds = atoi(firstMatch(output, `总计用时:\s*(\d+)\s*秒`))
 	if result.IP == "" {
 		return result, errors.New("未解析到优选 IP")
@@ -1519,6 +1888,39 @@ func normalizeCredentialMode(raw string) string {
 		return "custom"
 	}
 	return "shared"
+}
+
+func normalizeLocationMode(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "strict":
+		return "strict"
+	case "prefer":
+		return "prefer"
+	default:
+		return "any"
+	}
+}
+
+func locationFilterSummary(settings Settings) string {
+	if normalizeLocationMode(settings.LocationMode) == "any" || (settings.LocationCountry == "" && settings.LocationRegion == "" && settings.LocationCity == "") {
+		return "全局随机"
+	}
+	parts := make([]string, 0, 4)
+	if settings.LocationMode == "strict" {
+		parts = append(parts, "严格地区")
+	} else {
+		parts = append(parts, "地区优先")
+	}
+	if settings.LocationCountry != "" {
+		parts = append(parts, settings.LocationCountry)
+	}
+	if settings.LocationRegion != "" {
+		parts = append(parts, settings.LocationRegion)
+	}
+	if settings.LocationCity != "" {
+		parts = append(parts, settings.LocationCity)
+	}
+	return strings.Join(parts, " / ")
 }
 
 func activeIPv4Count(settings Settings) int {
@@ -2130,6 +2532,9 @@ func buildIPResultViews(results []IPTestResult) []IPResultView {
 			PeakSpeedKBps:           result.PeakSpeedKBps,
 			RTTMs:                   result.RTTMs,
 			DataCenter:              result.DataCenter,
+			DataCenterCode:          result.DataCenterCode,
+			DataCenterCountry:       result.DataCenterCountry,
+			DataCenterRegion:        result.DataCenterRegion,
 			DurationSeconds:         result.DurationSeconds,
 			SyncedText:              syncedText,
 			TestedAt:                result.TestedAt,
@@ -2289,11 +2694,12 @@ func dnsStatusText(status string) string {
 }
 
 func runSummary(trigger string, settings Settings) string {
-	return fmt.Sprintf("%s / %s / IPv4:%d IPv6:%d / %d Mbps / RTT:%d",
+	return fmt.Sprintf("%s / %s / IPv4:%d IPv6:%d / %s / %d Mbps / RTT:%d",
 		triggerLabel(trigger),
 		dnsTargetModeLabel(settings.DNSTargetMode),
 		activeIPv4Count(settings),
 		activeIPv6Count(settings),
+		locationFilterSummary(settings),
 		settings.BandwidthMbps,
 		settings.RTTConcurrency,
 	)
@@ -2381,7 +2787,7 @@ const layoutTemplate = `
     h1 { font-size: 24px; margin: 0 0 16px; }
     h2 { font-size: 18px; margin: 0 0 12px; }
     label { display: block; font-weight: 600; margin: 14px 0 6px; }
-    input[type="text"], input[type="password"], input[type="number"], input[type="time"] { width: 100%; box-sizing: border-box; border: 1px solid #d1d5db; border-radius: 6px; padding: 10px 12px; font-size: 15px; }
+    input[type="text"], input[type="password"], input[type="number"], input[type="time"], select { width: 100%; box-sizing: border-box; border: 1px solid #d1d5db; border-radius: 6px; padding: 10px 12px; font-size: 15px; background: white; }
     button, .button { background: #2563eb; color: white; border: 0; border-radius: 6px; padding: 10px 14px; font-size: 15px; cursor: pointer; text-decoration: none; display: inline-block; }
     button.secondary { background: #4b5563; }
     button.danger { background: #b91c1c; }
@@ -2558,6 +2964,7 @@ const dashboardTemplate = `
     <ul class="compact-list">
       <li><span>IPv4 A</span><strong>{{if .Settings.IPv4Enabled}}{{if .IPv4RecordName}}{{.IPv4RecordName}}{{else}}未配置{{end}}{{else}}未启用{{end}}</strong></li>
       <li><span>IPv6 AAAA</span><strong>{{if .Settings.IPv6Enabled}}{{if .IPv6RecordName}}{{.IPv6RecordName}}{{else}}未配置{{end}}{{else}}未启用{{end}}</strong></li>
+      <li><span>地区筛选</span><strong>{{.LocationSummary}}</strong></li>
       <li><span>计划</span><strong>{{.ScheduleSummary}}</strong></li>
       <li><span>下次</span><strong>{{.NextRunAt}}</strong></li>
       <li><span>配置</span><strong>{{if .Stats.ConfigReady}}可执行{{else}}{{.Stats.ConfigHint}}{{end}}</strong></li>
@@ -2646,7 +3053,7 @@ const resultTemplate = `
           <td>{{.MeasuredBandwidthMbps}} Mbps</td>
           <td>{{.PeakSpeedKBps}} kB/s</td>
           <td>{{.RTTMs}} ms</td>
-          <td>{{.DataCenter}}</td>
+          <td>{{.DataCenter}}{{if .DataCenterCode}} ({{.DataCenterCode}}){{end}}{{if .DataCenterRegion}}<br><span class="muted">{{.DataCenterRegion}}</span>{{end}}</td>
           <td>{{.DurationSeconds}} 秒</td>
           <td>{{.SyncedText}}</td>
           <td>{{.TestedAt}}</td>
@@ -2735,6 +3142,48 @@ const settingsTemplate = `
       </div>
     </div>
 
+    <h2 style="margin-top:22px">地区筛选</h2>
+    <p class="muted">先从 Cloudflare IP 地区网段数据库中按国家、区域和城市筛选 CIDR，再从这些网段中生成 IPv4 / IPv6 候选 IP 测速。<code>CF-RAY</code> 只用于展示实际响应机房。</p>
+    <div class="row" style="margin-bottom:12px">
+      {{if .GeoDatabase.Ready}}
+        <span class="muted">数据库已就绪：{{.GeoDatabase.GeoFeedCount}} 条 IP 网段，更新于 {{.GeoDatabase.UpdatedAt}}</span>
+      {{else}}
+        <span class="muted">地区 IP 网段数据库尚未下载，请先点击更新。</span>
+      {{end}}
+      <button type="submit" class="ghost" formaction="/settings/geo-refresh" formmethod="post">更新地区 IP 数据库</button>
+    </div>
+    <div class="row">
+      <label class="checkbox"><input type="radio" name="location_mode" value="any" {{if eq .Settings.LocationMode "any"}}checked{{end}}> 全局随机</label>
+      <label class="checkbox"><input type="radio" name="location_mode" value="prefer" {{if eq .Settings.LocationMode "prefer"}}checked{{end}}> 地区网段优先，10 分钟后回退全局</label>
+      <label class="checkbox"><input type="radio" name="location_mode" value="strict" {{if eq .Settings.LocationMode "strict"}}checked{{end}}> 仅测试所选地区网段</label>
+    </div>
+    <div class="grid">
+      <div>
+        <label for="location-country">国家 / 地区</label>
+        <select id="location-country" name="location_country">
+          <option value="">所有国家</option>
+          {{range .GeoCountries}}<option value="{{.Value}}" {{if .Selected}}selected{{end}}>{{.Label}}</option>{{end}}
+        </select>
+      </div>
+      <div>
+        <label for="location-region">区域 / 数据中心代码</label>
+        <select id="location-region" name="location_region">
+          <option value="">所有区域</option>
+          {{range .GeoRegions}}<option value="{{.Value}}" {{if .Selected}}selected{{end}}>{{.Label}}</option>{{end}}
+        </select>
+      </div>
+      <div>
+        <label for="location-city">城市</label>
+        <select id="location-city" name="location_city">
+          <option value="">所有城市</option>
+          {{range .GeoCities}}<option value="{{.Value}}" {{if .Selected}}selected{{end}}>{{.Label}}</option>{{end}}
+        </select>
+      </div>
+    </div>
+    <div id="geo-location-source" hidden>
+      {{range .GeoLocations}}<span data-country="{{.Country}}" data-region="{{.Region}}" data-city="{{.City}}"></span>{{end}}
+    </div>
+
     <h2 style="margin-top:22px">扫描参数</h2>
     <div class="grid">
       <div>
@@ -2784,6 +3233,55 @@ const settingsTemplate = `
     <p class="row"><button type="submit">保存配置</button><a class="button" href="/dashboard">返回 Dashboard</a></p>
   </form>
 </section>
+<script>
+  (function () {
+    var country = document.getElementById("location-country");
+    var region = document.getElementById("location-region");
+    var city = document.getElementById("location-city");
+    var source = Array.prototype.map.call(document.querySelectorAll("#geo-location-source span"), function (node) {
+      return { country: node.dataset.country, region: node.dataset.region, city: node.dataset.city };
+    });
+    if (!country || !region || !city || source.length === 0) return;
+
+    function valuesFor(field, countryValue, regionValue) {
+      var seen = {};
+      return source.filter(function (item) {
+        return (!countryValue || item.country === countryValue) && (!regionValue || item.region === regionValue);
+      }).map(function (item) { return item[field]; }).filter(function (value) {
+        if (!value || seen[value]) return false;
+        seen[value] = true;
+        return true;
+      }).sort(function (a, b) { return a.localeCompare(b); });
+    }
+
+    function replaceOptions(select, values, emptyLabel, preferred) {
+      select.innerHTML = "";
+      var empty = document.createElement("option");
+      empty.value = "";
+      empty.textContent = emptyLabel;
+      select.appendChild(empty);
+      values.forEach(function (value) {
+        var option = document.createElement("option");
+        option.value = value;
+        option.textContent = value;
+        select.appendChild(option);
+      });
+      select.value = values.indexOf(preferred) >= 0 ? preferred : "";
+    }
+
+    function refresh(resetRegion, resetCity) {
+      var selectedRegion = resetRegion ? "" : region.value;
+      var regions = valuesFor("region", country.value, "");
+      replaceOptions(region, regions, "所有区域", selectedRegion);
+      var selectedCity = resetCity ? "" : city.value;
+      var cities = valuesFor("city", country.value, region.value);
+      replaceOptions(city, cities, "所有城市", selectedCity);
+    }
+
+    country.addEventListener("change", function () { refresh(true, true); });
+    region.addEventListener("change", function () { refresh(false, true); });
+  })();
+</script>
 {{end}}
 `
 
@@ -2809,6 +3307,7 @@ const runTemplate = `
     <div class="metric"><span>今日写入 DNS</span><strong>{{.Stats.TodaySyncedIPs}} / {{.Stats.ExpectedIPCount}}</strong></div>
     <div class="metric"><span>今日任务</span><strong>{{.Stats.TodayTaskCount}}</strong></div>
     <div class="metric"><span>定时策略</span><strong>{{.ScheduleSummary}}</strong></div>
+    <div class="metric"><span>地区筛选</span><strong>{{.LocationSummary}}</strong></div>
   </div>
 </section>
 {{template "ipResultPanel" .}}

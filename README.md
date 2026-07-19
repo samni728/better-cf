@@ -38,6 +38,9 @@ Better CF 是一个基于 `better-cloudflare-ip` 的 Cloudflare 优选 IP 自动
 
 - 是否启用 IPv4 扫描与 A 记录同步
 - 是否启用 IPv6 扫描与 AAAA 记录同步
+- 全局随机、地区优先或严格地区筛选
+- 按 Cloudflare IP 网段数据库选择国家、区域/数据中心代码和城市
+- 国家、区域、城市三级联动，例如 `CN → CN-GD → Guangzhou`
 - IPv4 写入数量
 - IPv6 写入数量
 - 期望带宽 Mbps
@@ -159,6 +162,14 @@ scripts/
 data/app_state.json
 ```
 
+仓库内置一份最新 Cloudflare GeoFeed 快照：
+
+```text
+database/local-ip-ranges.csv
+```
+
+文件每行字段为 `CIDR, 国家, 区域/数据中心代码, 城市` 。首次启动会复制到 `data/local-ip-ranges.csv`；之后可在 WebUI 的“地区筛选”中点击“更新地区 IP 数据库”，从 Cloudflare GeoFeed 重新下载、校验并原子替换运行时数据。
+
 该目录包含管理员账号哈希、Cloudflare Token、任务历史和测速结果，不应该提交到 Git。
 
 ## Docker Compose 启动
@@ -213,6 +224,7 @@ BETTER_CF_PORT=18080
 TZ=Asia/Shanghai
 BETTER_CF_RUN_TIMEOUT_HOURS=3
 BETTER_CF_FAMILY_TIMEOUT_MINUTES=30
+BETTER_CF_LOCATION_PREFER_MINUTES=10
 ```
 
 Compose 会把运行数据挂载到本地：
@@ -228,6 +240,7 @@ Compose 会把运行数据挂载到本地：
 - 任务日志
 - 测速结果
 - `better-cloudflare-ip` 下载的 IP 池和数据中心缓存
+- 运行时地区 IP 网段数据库
 
 `data/` 不应该提交到 Git。
 
@@ -297,6 +310,7 @@ http://服务器IP:18080
 - Zone ID
 - 目标域名
 - IPv4 / IPv6 数量
+- 地区筛选模式、国家、区域/数据中心代码和城市
 - 带宽目标
 - RTT 测试进程数
 - 定时策略

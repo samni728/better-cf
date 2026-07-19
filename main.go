@@ -10,6 +10,7 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"sort"
@@ -17,6 +18,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"cf-betterip-ser/internal/geodb"
 )
 
 // 命令行版本的入口
@@ -123,12 +126,17 @@ func runIPSelector(ipType int, useTLS bool) {
 
 	speed := bandwidth * 128
 	startTime := time.Now()
+	filter := locationFilterFromEnv()
+	if filter.Enabled() {
+		fmt.Println("地区筛选:", filter.Summary())
+	}
 
 	// 执行 Cloudflare 测试
-	anycast, max, avgms, dataCenter := cloudflareTest(ipType, useTLS, taskNum, speed)
+	anycast, max, avgms, dataCenterCode := cloudflareTest(ipType, useTLS, taskNum, speed, filter)
 
 	realBandwidth := max / 128
 	endTime := time.Now()
+	dataCenter := lookupLocation(dataCenterCode)
 
 	fmt.Println()
 	fmt.Println("优选 IP:", anycast)
@@ -136,12 +144,16 @@ func runIPSelector(ipType int, useTLS bool) {
 	fmt.Println("实测带宽:", realBandwidth, "Mbps")
 	fmt.Println("峰值速度:", max, "kB/s")
 	fmt.Println("往返延迟:", avgms, "毫秒")
-	fmt.Println("数据中心:", dataCenter)
+	fmt.Println("数据中心:", locationDisplayName(dataCenterCode, dataCenter))
+	fmt.Println("数据中心代码:", dataCenterCode)
+	fmt.Println("数据中心国家:", dataCenter.Cca2)
+	fmt.Println("数据中心区域:", dataCenter.Region)
+	fmt.Println("数据中心城市:", dataCenter.City)
 	fmt.Println("总计用时:", int(endTime.Sub(startTime).Seconds()), "秒")
 }
 
 // cloudflareTest 核心测试逻辑
-func cloudflareTest(ipType int, useTLS bool, taskNum int, speed int) (string, int, int, string) {
+func cloudflareTest(ipType int, useTLS bool, taskNum int, speed int, filter locationFilter) (string, int, int, string) {
 	downloadAllData()
 	filename := dataPath("ips-v4.txt")
 	if ipType == 6 {
@@ -153,23 +165,48 @@ func cloudflareTest(ipType int, useTLS bool, taskNum int, speed int) (string, in
 		return "", 0, 0, ""
 	}
 	ipList := parseIPList(content)
-	fmt.Printf("正在从 %d 个子网中随机生成 IP...\n", len(ipList))
+	var geoPrefixes []netip.Prefix
+	if filter.Enabled() {
+		geoPrefixes, err = loadGeoPrefixes(ipType, filter)
+		if err != nil {
+			fmt.Println("读取地区 IP 网段数据库失败:", err)
+			return "", 0, 0, ""
+		}
+		if len(geoPrefixes) == 0 {
+			fmt.Printf("数据库中没有符合 %s 的 IPv%d 网段。\n", filter.Summary(), ipType)
+			return "", 0, 0, ""
+		}
+		fmt.Printf("已从地区数据库筛选出 %d 个 IPv%d 网段。\n", len(geoPrefixes), ipType)
+	} else {
+		fmt.Printf("正在从 %d 个全局子网中随机生成 IP...\n", len(ipList))
+	}
 
 	sampleSize := 100
 	if len(ipList) < sampleSize {
 		sampleSize = len(ipList)
 	}
 
+	filterStartedAt := time.Now()
+	fallbackLogged := false
 	for {
+		activeFilter := filter.Active(time.Since(filterStartedAt))
+		if filter.Enabled() && !activeFilter.Enabled() && !fallbackLogged {
+			fmt.Printf("地区优先等待已达 %s，回退到全局随机模式。\n", filter.PreferDuration)
+			fallbackLogged = true
+		}
 		var rttResults []RTTResult
 		for {
-			sampled := randomSample(ipList, sampleSize)
-
 			var testIPs []string
-			if ipType == 6 {
-				testIPs = getRandomIPv6s(sampled)
+			if activeFilter.Enabled() {
+				sampled := randomSamplePrefixes(geoPrefixes, sampleSize)
+				testIPs = getRandomIPsFromPrefixes(sampled)
 			} else {
-				testIPs = getRandomIPv4s(sampled)
+				sampled := randomSample(ipList, sampleSize)
+				if ipType == 6 {
+					testIPs = getRandomIPv6s(sampled)
+				} else {
+					testIPs = getRandomIPv4s(sampled)
+				}
 			}
 
 			fmt.Printf("已生成 %d 个测试 IP，开始 RTT 测试...\n", len(testIPs))
@@ -179,6 +216,7 @@ func cloudflareTest(ipType int, useTLS bool, taskNum int, speed int) (string, in
 				break
 			}
 			fmt.Println("当前所有 IP 都存在 RTT 丢包，继续新的 RTT 测试...")
+			activeFilter = filter.Active(time.Since(filterStartedAt))
 		}
 
 		fmt.Println("待测速的 IP 地址")
@@ -199,16 +237,34 @@ func cloudflareTest(ipType int, useTLS bool, taskNum int, speed int) (string, in
 				fmt.Printf(", 数据中心 %s", lookupDataCenter(dc))
 			}
 			fmt.Println()
-
 			if maxSpeed >= speed {
-				if dc != "" {
-					return r.IP, maxSpeed, tcpMs, lookupDataCenter(dc)
-				}
 				return r.IP, maxSpeed, tcpMs, dc
 			}
 		}
 		fmt.Println("当前所有 IP 都未达到期望带宽，重新开始新一轮测试...")
 	}
+}
+
+func randomSamplePrefixes(list []netip.Prefix, n int) []netip.Prefix {
+	shuffled := append([]netip.Prefix(nil), list...)
+	randomMu.Lock()
+	randomGenerator.Shuffle(len(shuffled), func(i, j int) {
+		shuffled[i], shuffled[j] = shuffled[j], shuffled[i]
+	})
+	randomMu.Unlock()
+	if n > len(shuffled) {
+		n = len(shuffled)
+	}
+	return shuffled[:n]
+}
+
+func getRandomIPsFromPrefixes(prefixes []netip.Prefix) []string {
+	result := make([]string, 0, len(prefixes))
+	for _, prefix := range prefixes {
+		addr := geodb.RandomAddr(prefix, func() byte { return byte(nextRandomIntn(256)) })
+		result = append(result, addr.String())
+	}
+	return result
 }
 
 // randomSample 从列表中随机抽取 n 个元素
@@ -228,8 +284,9 @@ func randomSample(list []string, n int) []string {
 
 // RTTResult RTT 测试结果
 type RTTResult struct {
-	IP        string
-	LatencyMs int
+	IP             string
+	LatencyMs      int
+	DataCenterCode string
 }
 
 // runRTTTest 运行 RTT 测试（并发，带进度显示）
@@ -261,9 +318,9 @@ func runRTTTest(ipList []string, taskNum int, useTLS bool) []RTTResult {
 				}
 			}()
 
-			avgMs := testRTT(ip, useTLS)
+			avgMs, dc := testRTT(ip, useTLS)
 			if avgMs > 0 {
-				resultChan <- RTTResult{IP: ip, LatencyMs: avgMs}
+				resultChan <- RTTResult{IP: ip, LatencyMs: avgMs, DataCenterCode: dc}
 			}
 		}(ip)
 	}
@@ -294,18 +351,19 @@ func runRTTTest(ipList []string, taskNum int, useTLS bool) []RTTResult {
 
 // testRTT 测试单个 IP 的 RTT（TCP 连接 + 验证 CF-RAY）
 // 连续 3 次取 TCP 连接时间，取平均延迟，中间任何一次失败直接丢弃
-func testRTT(ip string, useTLS bool) int {
+func testRTT(ip string, useTLS bool) (int, string) {
 	port := 80
 	if useTLS {
 		port = 443
 	}
 
 	var totalMs int
+	dataCenterCode := ""
 	for range 3 {
 		start := time.Now()
 		conn, err := net.DialTimeout("tcp", net.JoinHostPort(ip, strconv.Itoa(port)), 1*time.Second)
 		if err != nil {
-			return 0
+			return 0, ""
 		}
 		tcpDuration := time.Since(start)
 
@@ -316,7 +374,7 @@ func testRTT(ip string, useTLS bool) int {
 			tlsConn := tls.Client(conn, &tls.Config{ServerName: "cloudflare.com", InsecureSkipVerify: true})
 			if err := tlsConn.Handshake(); err != nil {
 				conn.Close()
-				return 0
+				return 0, ""
 			}
 			rwc = tlsConn
 		}
@@ -325,25 +383,29 @@ func testRTT(ip string, useTLS bool) int {
 		_, err = rwc.Write([]byte(reqStr))
 		if err != nil {
 			rwc.Close()
-			return 0
+			return 0, ""
 		}
 
 		reader := bufio.NewReader(rwc)
 		resp, err := http.ReadResponse(reader, nil)
 		rwc.Close()
 		if err != nil {
-			return 0
+			return 0, ""
 		}
 		resp.Body.Close()
 
-		if resp.Header.Get("CF-RAY") == "" {
-			return 0
+		colo := extractDataCenter(resp.Header.Get("CF-RAY"))
+		if colo == "" {
+			return 0, ""
+		}
+		if dataCenterCode == "" {
+			dataCenterCode = colo
 		}
 
 		totalMs += int(tcpDuration.Milliseconds())
 	}
 
-	return totalMs / 3
+	return totalMs / 3, dataCenterCode
 }
 
 // runSpeedTestSimple 简单速度测试，返回 (峰值速度 kB/s, TCP延迟ms, 三字码头)
@@ -426,14 +488,29 @@ func extractDataCenter(cfRay string) string {
 
 // lookupDataCenter 查找数据中心名称
 func lookupDataCenter(colo string) string {
-	locationMu.RLock()
-	loc := locationMap[colo]
-	locationMu.RUnlock()
+	loc := lookupLocation(colo)
 
 	if loc.City != "" {
 		return loc.City
 	}
 	return colo
+}
+
+func lookupLocation(colo string) location {
+	locationMu.RLock()
+	loc := locationMap[strings.ToUpper(strings.TrimSpace(colo))]
+	locationMu.RUnlock()
+	return loc
+}
+
+func locationDisplayName(colo string, loc location) string {
+	if loc.City == "" {
+		return strings.ToUpper(strings.TrimSpace(colo))
+	}
+	if loc.Cca2 == "" {
+		return loc.City
+	}
+	return fmt.Sprintf("%s / %s", loc.City, loc.Cca2)
 }
 
 // runSingleSpeedTest 单 IP 测速
@@ -482,7 +559,7 @@ func runSingleSpeedTest(useTLS bool) {
 
 // clearCache 清空缓存，删除所有数据文件，下次运行重新下载
 func clearCache() {
-	for _, f := range []string{"locations.json", "ips-v4.txt", "ips-v6.txt", "url.txt"} {
+	for _, f := range []string{"locations.json", "local-ip-ranges.csv", "ips-v4.txt", "ips-v6.txt", "url.txt"} {
 		os.Remove(dataPath(f))
 	}
 	fmt.Println("缓存已清空，下次操作会自动重新下载数据")
@@ -491,7 +568,7 @@ func clearCache() {
 // updateData 重新下载所有数据
 func updateData() {
 	fmt.Println("正在重新下载数据...")
-	for _, f := range []string{"locations.json", "ips-v4.txt", "ips-v6.txt", "url.txt"} {
+	for _, f := range []string{"locations.json", "local-ip-ranges.csv", "ips-v4.txt", "ips-v6.txt", "url.txt"} {
 		os.Remove(dataPath(f))
 	}
 	initLocations()
@@ -516,6 +593,96 @@ type location struct {
 	Cca2   string  `json:"cca2"`
 	Region string  `json:"region"`
 	City   string  `json:"city"`
+}
+
+type locationFilter struct {
+	Mode           string
+	Country        string
+	Region         string
+	City           string
+	PreferDuration time.Duration
+}
+
+func locationFilterFromEnv() locationFilter {
+	mode := strings.ToLower(strings.TrimSpace(os.Getenv("BETTER_CF_LOCATION_MODE")))
+	if mode != "strict" && mode != "prefer" {
+		mode = "any"
+	}
+	preferMinutes, err := strconv.Atoi(strings.TrimSpace(os.Getenv("BETTER_CF_LOCATION_PREFER_MINUTES")))
+	if err != nil || preferMinutes < 1 {
+		preferMinutes = 10
+	}
+	return locationFilter{
+		Mode:           mode,
+		Country:        strings.ToUpper(strings.TrimSpace(os.Getenv("BETTER_CF_LOCATION_COUNTRY"))),
+		Region:         strings.TrimSpace(os.Getenv("BETTER_CF_LOCATION_REGION")),
+		City:           strings.TrimSpace(os.Getenv("BETTER_CF_LOCATION_CITY")),
+		PreferDuration: time.Duration(preferMinutes) * time.Minute,
+	}
+}
+
+func (f locationFilter) Enabled() bool {
+	return f.Mode != "any" && (f.Country != "" || f.Region != "" || f.City != "")
+}
+
+func (f locationFilter) Active(elapsed time.Duration) locationFilter {
+	if !f.Enabled() {
+		return locationFilter{Mode: "any"}
+	}
+	if f.Mode == "prefer" && elapsed >= f.PreferDuration {
+		return locationFilter{Mode: "any"}
+	}
+	return f
+}
+
+func (f locationFilter) Summary() string {
+	parts := make([]string, 0, 4)
+	if f.Mode == "strict" {
+		parts = append(parts, "严格地区")
+	} else if f.Mode == "prefer" {
+		parts = append(parts, fmt.Sprintf("地区优先（%s 后回退）", f.PreferDuration))
+	}
+	if f.Country != "" {
+		parts = append(parts, "国家="+f.Country)
+	}
+	if f.Region != "" {
+		parts = append(parts, "区域="+f.Region)
+	}
+	if f.City != "" {
+		parts = append(parts, "城市="+f.City)
+	}
+	if len(parts) == 0 {
+		return "全局随机"
+	}
+	return strings.Join(parts, " / ")
+}
+
+func loadGeoPrefixes(ipType int, filter locationFilter) ([]netip.Prefix, error) {
+	path := dataPath("local-ip-ranges.csv")
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		fmt.Println("本地地区 IP 网段数据库不存在，正在从 Cloudflare 更新...")
+		content, err := getURLContent("https://api.cloudflare.com/local-ip-ranges.csv")
+		if err != nil {
+			return nil, err
+		}
+		if err := saveToFile(path, content); err != nil {
+			return nil, err
+		}
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	entries, err := geodb.Parse(file)
+	if err != nil {
+		return nil, err
+	}
+	return geodb.Prefixes(entries, ipType, geodb.Filter{
+		Country: filter.Country,
+		Region:  filter.Region,
+		City:    filter.City,
+	}), nil
 }
 
 func dataPath(name string) string {
