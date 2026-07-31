@@ -78,8 +78,8 @@ func showMenu() {
 
 // runIPSelector 运行 IP 优选流程
 func runIPSelector(ipType int, useTLS bool) {
-	var bandwidth int
-	var taskNum int
+	bandwidth := 1
+	taskNum := 50
 
 	fmt.Print("请设置期望的带宽大小 (默认最小 1，单位 Mbps): ")
 	scanner := bufio.NewScanner(os.Stdin)
@@ -310,6 +310,9 @@ type RTTResult struct {
 func runRTTTest(ipList []string, taskNum int, useTLS bool, maxRTTMs int, filter locationFilter) []RTTResult {
 	if len(ipList) == 0 {
 		return nil
+	}
+	if taskNum < 1 {
+		taskNum = 1
 	}
 	if len(ipList) < taskNum {
 		taskNum = len(ipList)
