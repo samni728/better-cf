@@ -21,6 +21,15 @@ func TestParseFilterAndLocations(t *testing.T) {
 	if len(locations) != 4 {
 		t.Fatalf("unexpected locations: %+v", locations)
 	}
+	for _, location := range locations {
+		if location.Country == "CN" && location.Region == "CN-GD" && location.City == "Guangzhou" {
+			if location.IPv4Count != 0 || location.IPv6Count != 1 {
+				t.Fatalf("unexpected Guangzhou family counts: %+v", location)
+			}
+			return
+		}
+	}
+	t.Fatal("Guangzhou location not found")
 }
 
 func TestBundledDatabaseSupportsCountryRegionCityAndBothFamilies(t *testing.T) {

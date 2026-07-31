@@ -25,9 +25,11 @@ type Filter struct {
 }
 
 type Location struct {
-	Country string
-	Region  string
-	City    string
+	Country   string
+	Region    string
+	City      string
+	IPv4Count int
+	IPv6Count int
 }
 
 func Parse(reader io.Reader) ([]Entry, error) {
@@ -99,18 +101,24 @@ func Prefixes(entries []Entry, family int, filter Filter) []netip.Prefix {
 
 // Locations returns unique country/region/city combinations for cascading UI filters.
 func Locations(entries []Entry) []Location {
-	seen := make(map[string]bool)
+	indexes := make(map[string]int)
 	locations := make([]Location, 0)
 	for _, entry := range entries {
 		if entry.Country == "" {
 			continue
 		}
 		key := entry.Country + "\x00" + entry.Region + "\x00" + entry.City
-		if seen[key] {
-			continue
+		index, exists := indexes[key]
+		if !exists {
+			index = len(locations)
+			indexes[key] = index
+			locations = append(locations, Location{Country: entry.Country, Region: entry.Region, City: entry.City})
 		}
-		seen[key] = true
-		locations = append(locations, Location{Country: entry.Country, Region: entry.Region, City: entry.City})
+		if entry.Prefix.Addr().Is4() {
+			locations[index].IPv4Count++
+		} else {
+			locations[index].IPv6Count++
+		}
 	}
 	sort.Slice(locations, func(i, j int) bool {
 		if locations[i].Country != locations[j].Country {

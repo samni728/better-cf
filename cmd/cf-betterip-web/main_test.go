@@ -45,6 +45,54 @@ func TestBuildGeoChoicesCascadesByCountry(t *testing.T) {
 	}
 }
 
+func TestCalculateGeoFilterStats(t *testing.T) {
+	locations := []geodb.Location{
+		{Country: "CN", Region: "CN-GD", City: "Guangzhou", IPv4Count: 40, IPv6Count: 10},
+		{Country: "CN", Region: "CN-GD", City: "Shenzhen", IPv4Count: 12, IPv6Count: 4},
+		{Country: "JP", Region: "JP-13", City: "Tokyo", IPv4Count: 8, IPv6Count: 2},
+	}
+	stats := calculateGeoFilterStats(locations, Settings{
+		LocationCountry: "CN",
+		LocationRegion:  "CN-GD",
+		LocationCity:    "Guangzhou",
+	})
+	if stats.IPv4Count != 40 || stats.IPv6Count != 10 || stats.Total != 50 {
+		t.Fatalf("unexpected stats: %+v", stats)
+	}
+}
+
+func TestLocationSummaryExplainsIgnoredAndStrictSelections(t *testing.T) {
+	settings := Settings{
+		LocationMode:    "any",
+		LocationCountry: "CN",
+		LocationRegion:  "CN-GD",
+		LocationCity:    "Guangzhou",
+	}
+	if got := locationFilterSummary(settings); !strings.Contains(got, "当前不参与筛选") {
+		t.Fatalf("global summary is ambiguous: %q", got)
+	}
+	settings.LocationMode = "strict"
+	stats := GeoFilterStats{IPv4Count: 40, IPv6Count: 10, Total: 50}
+	got := locationFilterSummaryWithStats(settings, stats)
+	if !strings.Contains(got, "IPv4 40 段") || !strings.Contains(got, "IPv6 10 段") || !strings.Contains(got, "不回退全局") {
+		t.Fatalf("strict summary is incomplete: %q", got)
+	}
+}
+
+func TestRunSummaryFreezesStrictLocationAndCounts(t *testing.T) {
+	settings := defaultSettings()
+	settings.LocationMode = "strict"
+	settings.LocationCountry = "CN"
+	settings.LocationRegion = "CN-GD"
+	settings.LocationCity = "Guangzhou"
+	summary := runSummary("manual", settings, GeoFilterStats{IPv4Count: 40, IPv6Count: 10, Total: 50})
+	for _, required := range []string{"立即执行", "严格地区", "CN-GD", "Guangzhou", "IPv4 40 段", "IPv6 10 段", "不回退全局"} {
+		if !strings.Contains(summary, required) {
+			t.Fatalf("run summary %q does not contain %q", summary, required)
+		}
+	}
+}
+
 func TestValidateGeoFeed(t *testing.T) {
 	var data strings.Builder
 	for i := 0; i < 1000; i++ {

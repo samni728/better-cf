@@ -120,6 +120,12 @@ type RunRecord struct {
 	Logs            []RunLog `json:"logs"`
 }
 
+type GeoFilterStats struct {
+	IPv4Count int
+	IPv6Count int
+	Total     int
+}
+
 type RunLog struct {
 	At      string `json:"at"`
 	Level   string `json:"level"`
@@ -183,6 +189,8 @@ type PageData struct {
 	GeoCities           []GeoChoice
 	GeoLocations        []geodb.Location
 	GeoDatabase         GeoDatabaseStatus
+	GeoFilterStats      GeoFilterStats
+	FamilyNoResultLimit string
 }
 
 type GeoLocation struct {
@@ -533,6 +541,11 @@ func (a *App) geoSnapshot() ([]geodb.Location, GeoDatabaseStatus) {
 	return locations, a.geoDatabase
 }
 
+func (a *App) geoFilterStats(settings Settings) GeoFilterStats {
+	locations, _ := a.geoSnapshot()
+	return calculateGeoFilterStats(locations, settings)
+}
+
 func (a *App) updateGeoDatabase() (GeoDatabaseStatus, error) {
 	client := &http.Client{Timeout: 45 * time.Second}
 	geoFeedData, err := downloadData(client, cloudflareGeoFeedURL, 16*1024*1024)
@@ -768,7 +781,7 @@ func (s *Store) updateSettings(next Settings) error {
 	return s.saveLocked()
 }
 
-func (s *Store) createRun(trigger string, settings Settings) (RunRecord, error) {
+func (s *Store) createRun(trigger string, settings Settings, geoStats GeoFilterStats) (RunRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	run := RunRecord{
@@ -781,7 +794,7 @@ func (s *Store) createRun(trigger string, settings Settings) (RunRecord, error) 
 		RequiredIPCount: requiredIPCount(settings),
 		DNSStatus:       "pending",
 		StartedAt:       nowString(),
-		Summary:         runSummary(trigger, settings),
+		Summary:         runSummary(trigger, settings, geoStats),
 		Logs: []RunLog{{
 			At:      nowString(),
 			Level:   "info",
@@ -1136,6 +1149,7 @@ func (a *App) dashboard(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) pageData(title, username string, settings Settings) PageData {
 	geoLocations, geoDatabase := a.geoSnapshot()
+	geoStats := calculateGeoFilterStats(geoLocations, settings)
 	data := PageData{
 		Title:               title,
 		Username:            username,
@@ -1149,10 +1163,12 @@ func (a *App) pageData(title, username string, settings Settings) PageData {
 		IPv4TokenMasked:     maskToken(effectiveToken(settings, settings.IPv4Target)),
 		IPv6TokenMasked:     maskToken(effectiveToken(settings, settings.IPv6Target)),
 		ScheduleSummary:     scheduleSummary(settings),
-		LocationSummary:     locationFilterSummary(settings),
+		LocationSummary:     locationFilterSummaryWithStats(settings, geoStats),
 		NextRunAt:           nextRunText(settings),
 		GeoLocations:        geoLocations,
 		GeoDatabase:         geoDatabase,
+		GeoFilterStats:      geoStats,
+		FamilyNoResultLimit: formatDuration(familyNoResultTimeout()),
 	}
 	data.GeoCountries, data.GeoRegions, data.GeoCities = buildGeoChoices(geoLocations, settings)
 	return data
@@ -1195,6 +1211,25 @@ func buildGeoChoices(locations []geodb.Location, settings Settings) ([]GeoChoice
 		}
 	}
 	return geoChoices(countries, settings.LocationCountry), geoChoices(regions, settings.LocationRegion), geoChoices(cities, settings.LocationCity)
+}
+
+func calculateGeoFilterStats(locations []geodb.Location, settings Settings) GeoFilterStats {
+	stats := GeoFilterStats{}
+	for _, loc := range locations {
+		if settings.LocationCountry != "" && !strings.EqualFold(settings.LocationCountry, loc.Country) {
+			continue
+		}
+		if settings.LocationRegion != "" && !strings.EqualFold(settings.LocationRegion, loc.Region) {
+			continue
+		}
+		if settings.LocationCity != "" && !strings.EqualFold(settings.LocationCity, loc.City) {
+			continue
+		}
+		stats.IPv4Count += loc.IPv4Count
+		stats.IPv6Count += loc.IPv6Count
+	}
+	stats.Total = stats.IPv4Count + stats.IPv6Count
+	return stats
 }
 
 func geoChoices(values map[string]bool, selected string) []GeoChoice {
@@ -1263,6 +1298,13 @@ func (a *App) settings(w http.ResponseWriter, r *http.Request) {
 		if next.LocationCountry == "" && next.LocationRegion == "" && next.LocationCity == "" {
 			next.LocationMode = "any"
 		}
+		geoStats := a.geoFilterStats(next)
+		if next.LocationMode != "any" && geoStats.Total == 0 {
+			data = a.pageData("配置", user, next)
+			data.Error = "所选地区在当前数据库中没有匹配的 IPv4 或 IPv6 网段，配置尚未保存。请调整国家、区域或城市。"
+			a.render(w, settingsTemplate, data)
+			return
+		}
 		next.ScheduleEnabled = r.FormValue("schedule_enabled") == "on"
 		next.ScheduleMode = normalizeScheduleMode(r.FormValue("schedule_mode"))
 		next.ScheduleIntervalDays = clampInt(parseInt(r.FormValue("schedule_interval_days"), 1), 1, 365)
@@ -1273,7 +1315,7 @@ func (a *App) settings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		data = a.pageData("配置", user, next)
-		data.Flash = "配置已保存。"
+		data.Flash = "配置已保存；后续立即执行和定时任务将使用：" + data.LocationSummary
 	}
 	a.render(w, settingsTemplate, data)
 }
@@ -1323,7 +1365,8 @@ func (a *App) startRun(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/run", http.StatusFound)
 		return
 	}
-	run, err := a.store.createRun("manual", state.Settings)
+	geoStats := a.geoFilterStats(state.Settings)
+	run, err := a.store.createRun("manual", state.Settings, geoStats)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -1347,7 +1390,8 @@ func (a *App) resumeRun(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/run", http.StatusFound)
 		return
 	}
-	run, err := a.store.createRun("resume", state.Settings)
+	geoStats := a.geoFilterStats(state.Settings)
+	run, err := a.store.createRun("resume", state.Settings, geoStats)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -1414,7 +1458,9 @@ func (a *App) executeRunWithSeed(id string, settings Settings, sourceRunID strin
 	if sourceRunID != "" {
 		trigger = "resume"
 	}
-	a.store.appendRunLog(id, "info", "开始真实执行："+runSummary(trigger, settings))
+	geoStats := a.geoFilterStats(settings)
+	a.store.appendRunLog(id, "info", "开始真实执行："+runSummary(trigger, settings, geoStats))
+	a.store.appendRunLog(id, "info", "本次地区策略："+locationFilterSummaryWithStats(settings, geoStats))
 	a.store.appendRunLog(id, "info", fmt.Sprintf("任务保护：整体最长运行 %s；单个协议族 %s 无新增有效 IP 将自动失败。", formatDuration(runTimeout()), formatDuration(familyNoResultTimeout())))
 	if required <= 0 {
 		a.store.finishRun(id, "failed", "目标数量为 0，没有需要扫描或写入的 IP。")
@@ -1519,7 +1565,8 @@ func (a *App) schedulerLoop() {
 		if !shouldStartScheduledRun(state, time.Now()) {
 			continue
 		}
-		run, err := a.store.createRun("scheduled", state.Settings)
+		geoStats := a.geoFilterStats(state.Settings)
+		run, err := a.store.createRun("scheduled", state.Settings, geoStats)
 		if err != nil {
 			log.Printf("scheduled run create failed: %v", err)
 			continue
@@ -1910,15 +1957,25 @@ func normalizeLocationMode(raw string) string {
 }
 
 func locationFilterSummary(settings Settings) string {
-	if normalizeLocationMode(settings.LocationMode) == "any" || (settings.LocationCountry == "" && settings.LocationRegion == "" && settings.LocationCity == "") {
+	mode := normalizeLocationMode(settings.LocationMode)
+	selection := locationSelectionText(settings)
+	if mode == "any" {
+		if selection != "" {
+			return "全局随机（已保留地区 " + selection + "，但当前不参与筛选）"
+		}
 		return "全局随机"
 	}
-	parts := make([]string, 0, 4)
-	if settings.LocationMode == "strict" {
-		parts = append(parts, "严格地区")
-	} else {
-		parts = append(parts, "地区优先")
+	if selection == "" {
+		return "全局随机"
 	}
+	if mode == "strict" {
+		return "严格地区 / " + selection
+	}
+	return "地区优先 / " + selection
+}
+
+func locationSelectionText(settings Settings) string {
+	parts := make([]string, 0, 3)
 	if settings.LocationCountry != "" {
 		parts = append(parts, settings.LocationCountry)
 	}
@@ -1929,6 +1986,18 @@ func locationFilterSummary(settings Settings) string {
 		parts = append(parts, settings.LocationCity)
 	}
 	return strings.Join(parts, " / ")
+}
+
+func locationFilterSummaryWithStats(settings Settings, stats GeoFilterStats) string {
+	base := locationFilterSummary(settings)
+	if normalizeLocationMode(settings.LocationMode) == "any" || locationSelectionText(settings) == "" {
+		return base
+	}
+	counts := fmt.Sprintf("IPv4 %d 段，IPv6 %d 段", stats.IPv4Count, stats.IPv6Count)
+	if normalizeLocationMode(settings.LocationMode) == "strict" {
+		return fmt.Sprintf("%s（%s；不回退全局）", base, counts)
+	}
+	return fmt.Sprintf("%s（%s；单次选优连续 10 分钟无结果后回退全局）", base, counts)
 }
 
 func activeIPv4Count(settings Settings) int {
@@ -2701,13 +2770,13 @@ func dnsStatusText(status string) string {
 	}
 }
 
-func runSummary(trigger string, settings Settings) string {
+func runSummary(trigger string, settings Settings, geoStats GeoFilterStats) string {
 	return fmt.Sprintf("%s / %s / IPv4:%d IPv6:%d / %s / %d Mbps / RTT并发:%d / 最大RTT:%dms",
 		triggerLabel(trigger),
 		dnsTargetModeLabel(settings.DNSTargetMode),
 		activeIPv4Count(settings),
 		activeIPv6Count(settings),
-		locationFilterSummary(settings),
+		locationFilterSummaryWithStats(settings, geoStats),
 		settings.BandwidthMbps,
 		settings.RTTConcurrency,
 		settings.MaxRTTMs,
@@ -3161,10 +3230,19 @@ const settingsTemplate = `
       {{end}}
       <button type="submit" class="ghost" formaction="/settings/geo-refresh" formmethod="post">更新地区 IP 数据库</button>
     </div>
-    <div class="row">
-      <label class="checkbox"><input type="radio" name="location_mode" value="any" {{if eq .Settings.LocationMode "any"}}checked{{end}}> 全局随机</label>
-      <label class="checkbox"><input type="radio" name="location_mode" value="prefer" {{if eq .Settings.LocationMode "prefer"}}checked{{end}}> 地区网段优先，10 分钟后回退全局</label>
-      <label class="checkbox"><input type="radio" name="location_mode" value="strict" {{if eq .Settings.LocationMode "strict"}}checked{{end}}> 仅测试所选地区网段</label>
+    <div class="grid">
+      <label class="metric checkbox">
+        <input type="radio" name="location_mode" value="any" {{if eq .Settings.LocationMode "any"}}checked{{end}}>
+        <span><strong>全局随机</strong><br><span class="muted">忽略下方国家、区域和城市，从全球 IP 池随机抽取。</span></span>
+      </label>
+      <label class="metric checkbox">
+        <input type="radio" name="location_mode" value="prefer" {{if eq .Settings.LocationMode "prefer"}}checked{{end}}>
+        <span><strong>所选地区优先</strong><br><span class="muted">每次选优先在所选网段重试；连续 10 分钟没有结果才回退全球。</span></span>
+      </label>
+      <label class="metric checkbox">
+        <input type="radio" name="location_mode" value="strict" {{if eq .Settings.LocationMode "strict"}}checked{{end}}>
+        <span><strong>仅测试所选地区</strong><br><span class="muted">始终只测所选网段，不回退全球；连续 {{.FamilyNoResultLimit}} 无新增结果则该协议族任务失败。</span></span>
+      </label>
     </div>
     <div class="grid">
       <div>
@@ -3189,8 +3267,15 @@ const settingsTemplate = `
         </select>
       </div>
     </div>
+    <div class="metric" id="geo-selection-status" style="margin-top:12px">
+      <span id="geo-save-state">当前已保存配置</span>
+      <strong id="geo-effective-summary">{{.LocationSummary}}</strong>
+      <p id="geo-prefix-counts">当前选择匹配 IPv4 {{.GeoFilterStats.IPv4Count}} 条网段、IPv6 {{.GeoFilterStats.IPv6Count}} 条网段，共 {{.GeoFilterStats.Total}} 条。</p>
+      <p class="muted">这里统计的是 Cloudflare GeoFeed 的网段标签；实际请求最终响应的机房仍以测试结果中的 <code>CF-RAY</code> 为准，Anycast 路由可能到达其他机房。</p>
+      <button type="submit">保存地区筛选和全部配置</button>
+    </div>
     <div id="geo-location-source" hidden>
-      {{range .GeoLocations}}<span data-country="{{.Country}}" data-region="{{.Region}}" data-city="{{.City}}"></span>{{end}}
+      {{range .GeoLocations}}<span data-country="{{.Country}}" data-region="{{.Region}}" data-city="{{.City}}" data-v4="{{.IPv4Count}}" data-v6="{{.IPv6Count}}"></span>{{end}}
     </div>
 
     <h2 style="margin-top:22px">扫描参数</h2>
@@ -3252,8 +3337,18 @@ const settingsTemplate = `
     var country = document.getElementById("location-country");
     var region = document.getElementById("location-region");
     var city = document.getElementById("location-city");
+    var modeInputs = Array.prototype.slice.call(document.querySelectorAll('input[name="location_mode"]'));
+    var saveState = document.getElementById("geo-save-state");
+    var effectiveSummary = document.getElementById("geo-effective-summary");
+    var prefixCounts = document.getElementById("geo-prefix-counts");
     var source = Array.prototype.map.call(document.querySelectorAll("#geo-location-source span"), function (node) {
-      return { country: node.dataset.country, region: node.dataset.region, city: node.dataset.city };
+      return {
+        country: node.dataset.country,
+        region: node.dataset.region,
+        city: node.dataset.city,
+        v4: parseInt(node.dataset.v4 || "0", 10),
+        v6: parseInt(node.dataset.v6 || "0", 10)
+      };
     });
     if (!country || !region || !city || source.length === 0) return;
 
@@ -3292,8 +3387,71 @@ const settingsTemplate = `
       replaceOptions(city, cities, "所有城市", selectedCity);
     }
 
-    country.addEventListener("change", function () { refresh(true, true); });
-    region.addEventListener("change", function () { refresh(false, true); });
+    function selectedMode() {
+      var selected = modeInputs.filter(function (input) { return input.checked; })[0];
+      return selected ? selected.value : "any";
+    }
+
+    function selectedPath() {
+      return [country.value, region.value, city.value].filter(Boolean).join(" / ");
+    }
+
+    function switchGlobalSelectionToStrict() {
+      if (!selectedPath() || selectedMode() !== "any") return;
+      var strict = modeInputs.filter(function (input) { return input.value === "strict"; })[0];
+      if (strict) strict.checked = true;
+    }
+
+    function updateSelectionStatus(changed) {
+      var path = selectedPath();
+      var mode = selectedMode();
+      var counts = source.filter(function (item) {
+        return (!country.value || item.country === country.value) &&
+          (!region.value || item.region === region.value) &&
+          (!city.value || item.city === city.value);
+      }).reduce(function (sum, item) {
+        sum.v4 += item.v4;
+        sum.v6 += item.v6;
+        return sum;
+      }, {v4: 0, v6: 0});
+      if (prefixCounts) {
+        prefixCounts.textContent = "当前选择匹配 IPv4 " + counts.v4 + " 条网段、IPv6 " + counts.v6 + " 条网段，共 " + (counts.v4 + counts.v6) + " 条。";
+      }
+      if (effectiveSummary) {
+        if (mode === "any") {
+          effectiveSummary.textContent = path
+            ? "全局随机；已选择的 " + path + " 当前不会参与筛选"
+            : "全局随机；从全球 IP 池抽取";
+        } else if (mode === "prefer") {
+          effectiveSummary.textContent = "所选地区优先：" + (path || "尚未选择地区") + "；10 分钟无结果后回退全球";
+        } else {
+          effectiveSummary.textContent = "仅测试所选地区：" + (path || "尚未选择地区") + "；绝不回退全球";
+        }
+      }
+      if (changed && saveState) {
+        saveState.textContent = "页面配置已修改但尚未保存；立即执行和定时任务仍会使用上一次已保存配置";
+        saveState.style.color = "#b45309";
+      }
+    }
+
+    country.addEventListener("change", function () {
+      refresh(true, true);
+      switchGlobalSelectionToStrict();
+      updateSelectionStatus(true);
+    });
+    region.addEventListener("change", function () {
+      refresh(false, true);
+      switchGlobalSelectionToStrict();
+      updateSelectionStatus(true);
+    });
+    city.addEventListener("change", function () {
+      switchGlobalSelectionToStrict();
+      updateSelectionStatus(true);
+    });
+    modeInputs.forEach(function (input) {
+      input.addEventListener("change", function () { updateSelectionStatus(true); });
+    });
+    updateSelectionStatus(false);
   })();
 </script>
 {{end}}
@@ -3327,6 +3485,18 @@ const runTemplate = `
 {{template "ipResultPanel" .}}
 <section class="panel">
   <h2>运行日志</h2>
+  {{if .CurrentRun}}
+    <div class="metric" style="margin-bottom:14px">
+      <span>本次任务实际执行配置</span>
+      <strong>{{.CurrentRun.Summary}}</strong>
+      <p class="muted">这里显示的是任务创建时已经保存并冻结的配置，不受配置页尚未保存的修改影响。</p>
+    </div>
+  {{else if .LatestRun}}
+    <div class="metric" style="margin-bottom:14px">
+      <span>最近任务实际执行配置</span>
+      <strong>{{.LatestRun.Summary}}</strong>
+    </div>
+  {{end}}
   {{template "runs" .}}
 </section>
 {{end}}
