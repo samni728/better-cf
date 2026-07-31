@@ -63,3 +63,19 @@ func TestMaxRTTFromEnv(t *testing.T) {
 		t.Fatalf("maxRTTFromEnv() with invalid input = %d, want 200", got)
 	}
 }
+
+func TestGeoDatabasePathPrefersExplicitSharedDatabase(t *testing.T) {
+	old, existed := os.LookupEnv("BETTER_CF_GEO_DB_PATH")
+	t.Cleanup(func() {
+		if existed {
+			_ = os.Setenv("BETTER_CF_GEO_DB_PATH", old)
+		} else {
+			_ = os.Unsetenv("BETTER_CF_GEO_DB_PATH")
+		}
+	})
+
+	_ = os.Setenv("BETTER_CF_GEO_DB_PATH", "/tmp/shared-geo.csv")
+	if got := geoDatabasePath(); got != "/tmp/shared-geo.csv" {
+		t.Fatalf("geoDatabasePath() = %q, want shared path", got)
+	}
+}

@@ -768,7 +768,7 @@ func (f locationFilter) Summary() string {
 }
 
 func loadGeoPrefixes(ipType int, filter locationFilter) ([]netip.Prefix, error) {
-	path := dataPath("local-ip-ranges.csv")
+	path := geoDatabasePath()
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		fmt.Println("本地地区 IP 网段数据库不存在，正在从 Cloudflare 更新...")
 		content, err := getURLContent("https://api.cloudflare.com/local-ip-ranges.csv")
@@ -793,6 +793,13 @@ func loadGeoPrefixes(ipType int, filter locationFilter) ([]netip.Prefix, error) 
 		Region:  filter.Region,
 		City:    filter.City,
 	}), nil
+}
+
+func geoDatabasePath() string {
+	if path := strings.TrimSpace(os.Getenv("BETTER_CF_GEO_DB_PATH")); path != "" {
+		return path
+	}
+	return dataPath("local-ip-ranges.csv")
 }
 
 func dataPath(name string) string {

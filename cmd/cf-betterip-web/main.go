@@ -1590,7 +1590,7 @@ func (a *App) collectFamilyResults(ctx context.Context, id string, settings Sett
 
 		resultDeadline := lastResultAt.Add(noResultTimeout)
 		attemptCtx, cancel := context.WithDeadline(ctx, resultDeadline)
-		result, output, err := runBetterIPScan(attemptCtx, settings, ipVersion, func(message string) {
+		result, output, err := runBetterIPScan(attemptCtx, settings, ipVersion, a.geoDatabasePath(), func(message string) {
 			a.store.appendRunLog(id, "info", message)
 		})
 		cancel()
@@ -1644,7 +1644,15 @@ func (a *App) collectFamilyResults(ctx context.Context, id string, settings Sett
 	return results, nil
 }
 
-func runBetterIPScan(ctx context.Context, settings Settings, ipVersion int, onLog func(string)) (IPTestResult, string, error) {
+func (a *App) geoDatabasePath() string {
+	path := filepath.Join(a.dataDir, "local-ip-ranges.csv")
+	if absolute, err := filepath.Abs(path); err == nil {
+		return absolute
+	}
+	return path
+}
+
+func runBetterIPScan(ctx context.Context, settings Settings, ipVersion int, geoDatabasePath string, onLog func(string)) (IPTestResult, string, error) {
 	bin, err := findScannerBinary()
 	if err != nil {
 		return IPTestResult{}, "", err
@@ -1665,6 +1673,7 @@ func runBetterIPScan(ctx context.Context, settings Settings, ipVersion int, onLo
 	cmd.Dir = scannerWorkDir(bin)
 	cmd.Env = append(os.Environ(),
 		"BETTER_CF_MAX_RTT_MS="+strconv.Itoa(settings.MaxRTTMs),
+		"BETTER_CF_GEO_DB_PATH="+strings.TrimSpace(geoDatabasePath),
 		"BETTER_CF_LOCATION_MODE="+normalizeLocationMode(settings.LocationMode),
 		"BETTER_CF_LOCATION_COUNTRY="+strings.TrimSpace(settings.LocationCountry),
 		"BETTER_CF_LOCATION_REGION="+strings.TrimSpace(settings.LocationRegion),

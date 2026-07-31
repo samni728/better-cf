@@ -2,6 +2,7 @@ package main
 
 import (
 	"html/template"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -90,6 +91,15 @@ func TestRunSummaryFreezesStrictLocationAndCounts(t *testing.T) {
 		if !strings.Contains(summary, required) {
 			t.Fatalf("run summary %q does not contain %q", summary, required)
 		}
+	}
+}
+
+func TestAppGeoDatabasePathIsAbsoluteAndShared(t *testing.T) {
+	app := &App{dataDir: t.TempDir()}
+	got := app.geoDatabasePath()
+	want := filepath.Join(app.dataDir, "local-ip-ranges.csv")
+	if got != want || !filepath.IsAbs(got) {
+		t.Fatalf("geoDatabasePath() = %q, want absolute %q", got, want)
 	}
 }
 
