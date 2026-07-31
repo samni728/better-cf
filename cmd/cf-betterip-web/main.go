@@ -3262,7 +3262,7 @@ const settingsTemplate = `
         </select>
       </div>
       <div>
-        <label for="location-region">区域 / 数据中心代码</label>
+        <label for="location-region">区域 / 省级代码（GeoFeed）</label>
         <select id="location-region" name="location_region">
           <option value="">所有区域</option>
           {{range .GeoRegions}}<option value="{{.Value}}" {{if .Selected}}selected{{end}}>{{.Label}}</option>{{end}}

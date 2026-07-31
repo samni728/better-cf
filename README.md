@@ -39,7 +39,7 @@ Better CF 是一个基于 `better-cloudflare-ip` 的 Cloudflare 优选 IP 自动
 - 是否启用 IPv4 扫描与 A 记录同步
 - 是否启用 IPv6 扫描与 AAAA 记录同步
 - 全局随机、地区优先或严格地区筛选
-- 按 Cloudflare IP 网段数据库选择国家、区域/数据中心代码和城市
+- 按 Cloudflare IP 网段数据库选择国家、区域/省级代码和城市
 - 国家、区域、城市三级联动，例如 `CN → CN-GD → Guangzhou`
 - 实时显示当前地区匹配的 IPv4 / IPv6 网段数量，并明确提示配置是否已经保存
 - IPv4 写入数量
