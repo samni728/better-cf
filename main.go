@@ -124,6 +124,17 @@ func runIPSelector(ipType int, useTLS bool) {
 		}
 	}
 
+	maxRTTMs := maxRTTFromEnv()
+	if maxRTTMs == 0 {
+		fmt.Print("请设置最大 RTT (默认 200，单位毫秒): ")
+		if scanner.Scan() {
+			maxRTTMs = normalizeMaxRTT(parseIntWithDefault(scanner.Text(), 200))
+		}
+	}
+	if maxRTTMs == 0 {
+		maxRTTMs = 200
+	}
+
 	speed := bandwidth * 128
 	startTime := time.Now()
 	filter := locationFilterFromEnv()
@@ -132,7 +143,7 @@ func runIPSelector(ipType int, useTLS bool) {
 	}
 
 	// 执行 Cloudflare 测试
-	anycast, max, avgms, dataCenterCode := cloudflareTest(ipType, useTLS, taskNum, speed, filter)
+	anycast, max, avgms, dataCenterCode := cloudflareTest(ipType, useTLS, taskNum, speed, maxRTTMs, filter)
 
 	realBandwidth := max / 128
 	endTime := time.Now()
@@ -141,6 +152,7 @@ func runIPSelector(ipType int, useTLS bool) {
 	fmt.Println()
 	fmt.Println("优选 IP:", anycast)
 	fmt.Println("设置带宽:", bandwidth, "Mbps")
+	fmt.Println("最大 RTT:", maxRTTMs, "毫秒")
 	fmt.Println("实测带宽:", realBandwidth, "Mbps")
 	fmt.Println("峰值速度:", max, "kB/s")
 	fmt.Println("往返延迟:", avgms, "毫秒")
@@ -153,7 +165,7 @@ func runIPSelector(ipType int, useTLS bool) {
 }
 
 // cloudflareTest 核心测试逻辑
-func cloudflareTest(ipType int, useTLS bool, taskNum int, speed int, filter locationFilter) (string, int, int, string) {
+func cloudflareTest(ipType int, useTLS bool, taskNum int, speed int, maxRTTMs int, filter locationFilter) (string, int, int, string) {
 	downloadAllData()
 	filename := dataPath("ips-v4.txt")
 	if ipType == 6 {
@@ -211,7 +223,7 @@ func cloudflareTest(ipType int, useTLS bool, taskNum int, speed int, filter loca
 
 			fmt.Printf("已生成 %d 个测试 IP，开始 RTT 测试...\n", len(testIPs))
 
-			rttResults = runRTTTest(testIPs, taskNum, useTLS)
+			rttResults = runRTTTest(testIPs, taskNum, useTLS, maxRTTMs)
 			if len(rttResults) > 0 {
 				break
 			}
@@ -231,15 +243,48 @@ func cloudflareTest(ipType int, useTLS bool, taskNum int, speed int, filter loca
 			if useTLS {
 				speedPort = 443
 			}
-			maxSpeed, tcpMs, dc := runSpeedTestSimple(r.IP, speedPort, useTLS)
+			maxSpeed, _, dc := runSpeedTestSimple(r.IP, speedPort, useTLS)
 			fmt.Printf("%s 峰值速度 %d kB/s", r.IP, maxSpeed)
 			if dc != "" {
 				fmt.Printf(", 数据中心 %s", lookupDataCenter(dc))
 			}
 			fmt.Println()
-			if maxSpeed >= speed {
-				return r.IP, maxSpeed, tcpMs, dc
+			if maxSpeed < speed {
+				continue
 			}
+			if r.DataCenterCode != "" && dc != "" && !strings.EqualFold(r.DataCenterCode, dc) {
+				fmt.Printf("跳过 %s：初筛机房 %s 与下载机房 %s 不一致，路由不稳定。\n", r.IP, r.DataCenterCode, dc)
+				continue
+			}
+
+			// 下载可能改变队列和路由状态，达标后重新测量一次。
+			// 只有初筛和复检都稳定，才把 IP 作为最终结果。
+			time.Sleep(500 * time.Millisecond)
+			postAvgMs, postMaxMs, postDC := testRTT(r.IP, useTLS)
+			if postAvgMs <= 0 {
+				fmt.Printf("跳过 %s：下载后 RTT 复检失败。\n", r.IP)
+				continue
+			}
+			if dc != "" && postDC != "" && !strings.EqualFold(dc, postDC) {
+				fmt.Printf("跳过 %s：下载机房 %s 与复检机房 %s 不一致，路由不稳定。\n", r.IP, dc, postDC)
+				continue
+			}
+			if r.DataCenterCode != "" && postDC != "" && !strings.EqualFold(r.DataCenterCode, postDC) {
+				fmt.Printf("跳过 %s：初筛机房 %s 与复检机房 %s 不一致，路由不稳定。\n", r.IP, r.DataCenterCode, postDC)
+				continue
+			}
+			stableAvgMs := maxInt(r.LatencyMs, postAvgMs)
+			stableMaxMs := maxInt(r.MaxLatencyMs, postMaxMs)
+			fmt.Printf("%s RTT 复检：初筛平均 %d ms / 最大 %d ms，下载后平均 %d ms / 最大 %d ms。\n",
+				r.IP, r.LatencyMs, r.MaxLatencyMs, postAvgMs, postMaxMs)
+			if maxRTTMs > 0 && stableMaxMs > maxRTTMs {
+				fmt.Printf("跳过 %s：稳定性 RTT %d ms 超过上限 %d ms。\n", r.IP, stableMaxMs, maxRTTMs)
+				continue
+			}
+			if dc == "" {
+				dc = postDC
+			}
+			return r.IP, maxSpeed, stableAvgMs, dc
 		}
 		fmt.Println("当前所有 IP 都未达到期望带宽，重新开始新一轮测试...")
 	}
@@ -286,11 +331,12 @@ func randomSample(list []string, n int) []string {
 type RTTResult struct {
 	IP             string
 	LatencyMs      int
+	MaxLatencyMs   int
 	DataCenterCode string
 }
 
 // runRTTTest 运行 RTT 测试（并发，带进度显示）
-func runRTTTest(ipList []string, taskNum int, useTLS bool) []RTTResult {
+func runRTTTest(ipList []string, taskNum int, useTLS bool, maxRTTMs int) []RTTResult {
 	if len(ipList) < taskNum {
 		taskNum = len(ipList)
 	}
@@ -318,9 +364,9 @@ func runRTTTest(ipList []string, taskNum int, useTLS bool) []RTTResult {
 				}
 			}()
 
-			avgMs, dc := testRTT(ip, useTLS)
+			avgMs, maxMs, dc := testRTT(ip, useTLS)
 			if avgMs > 0 {
-				resultChan <- RTTResult{IP: ip, LatencyMs: avgMs, DataCenterCode: dc}
+				resultChan <- RTTResult{IP: ip, LatencyMs: avgMs, MaxLatencyMs: maxMs, DataCenterCode: dc}
 			}
 		}(ip)
 	}
@@ -331,12 +377,23 @@ func runRTTTest(ipList []string, taskNum int, useTLS bool) []RTTResult {
 	}()
 
 	var results []RTTResult
+	skippedHighRTT := 0
 	for r := range resultChan {
+		if maxRTTMs > 0 && r.MaxLatencyMs > maxRTTMs {
+			skippedHighRTT++
+			continue
+		}
 		results = append(results, r)
+	}
+	if skippedHighRTT > 0 {
+		fmt.Printf("RTT 初筛跳过 %d 个超过 %d ms 上限的 IP。\n", skippedHighRTT, maxRTTMs)
 	}
 
 	// 按最小延迟排序，最多保留前 10 个进入速度测试
 	sort.Slice(results, func(i, j int) bool {
+		if results[i].LatencyMs == results[j].LatencyMs {
+			return results[i].MaxLatencyMs < results[j].MaxLatencyMs
+		}
 		return results[i].LatencyMs < results[j].LatencyMs
 	})
 
@@ -349,72 +406,92 @@ func runRTTTest(ipList []string, taskNum int, useTLS bool) []RTTResult {
 	return results
 }
 
-// testRTT 测试单个 IP 的 RTT（TCP 连接 + 验证 CF-RAY）
-// 连续 3 次取 TCP 连接时间，取平均延迟，中间任何一次失败直接丢弃
-func testRTT(ip string, useTLS bool) (int, string) {
+// testRTT 测试单个 IP 的 RTT（TCP 连接 + 验证 CF-RAY）。
+// 与原 Shell 版保持一致：使用实际测速域名的 /cdn-cgi/trace，
+// 连续 3 次取 TCP 建连时间，任意一次失败或机房漂移就丢弃。
+func testRTT(ip string, useTLS bool) (int, int, string) {
 	port := 80
 	if useTLS {
 		port = 443
 	}
 
 	var totalMs int
+	maxMs := 0
 	dataCenterCode := ""
 	for range 3 {
 		start := time.Now()
 		conn, err := net.DialTimeout("tcp", net.JoinHostPort(ip, strconv.Itoa(port)), 1*time.Second)
 		if err != nil {
-			return 0, ""
+			return 0, 0, ""
 		}
 		tcpDuration := time.Since(start)
 
-		conn.SetDeadline(start.Add(1 * time.Second))
+		conn.SetDeadline(time.Now().Add(3 * time.Second))
 
 		var rwc net.Conn = conn
 		if useTLS {
-			tlsConn := tls.Client(conn, &tls.Config{ServerName: "cloudflare.com", InsecureSkipVerify: true})
+			tlsConn := tls.Client(conn, &tls.Config{ServerName: speedTestDomain})
 			if err := tlsConn.Handshake(); err != nil {
 				conn.Close()
-				return 0, ""
+				return 0, 0, ""
 			}
 			rwc = tlsConn
 		}
 
-		reqStr := "GET / HTTP/1.1\r\nHost: cloudflare.com\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n"
+		requestTarget := "/cdn-cgi/trace"
+		if !useTLS {
+			requestTarget = "http://" + speedTestDomain + requestTarget
+		}
+		reqStr := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n", requestTarget, speedTestDomain)
 		_, err = rwc.Write([]byte(reqStr))
 		if err != nil {
 			rwc.Close()
-			return 0, ""
+			return 0, 0, ""
 		}
 
 		reader := bufio.NewReader(rwc)
 		resp, err := http.ReadResponse(reader, nil)
 		rwc.Close()
 		if err != nil {
-			return 0, ""
+			return 0, 0, ""
 		}
 		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return 0, 0, ""
+		}
 
 		colo := extractDataCenter(resp.Header.Get("CF-RAY"))
 		if colo == "" {
-			return 0, ""
+			return 0, 0, ""
 		}
 		if dataCenterCode == "" {
 			dataCenterCode = colo
+		} else if !strings.EqualFold(dataCenterCode, colo) {
+			return 0, 0, ""
 		}
 
-		totalMs += int(tcpDuration.Milliseconds())
+		sampleMs := int(tcpDuration.Milliseconds())
+		if sampleMs < 1 {
+			sampleMs = 1
+		}
+		totalMs += sampleMs
+		if sampleMs > maxMs {
+			maxMs = sampleMs
+		}
 	}
 
-	return totalMs / 3, dataCenterCode
+	return totalMs / 3, maxMs, dataCenterCode
 }
 
-// runSpeedTestSimple 简单速度测试，返回 (峰值速度 kB/s, TCP延迟ms, 三字码头)
+// runSpeedTestSimple 简单速度测试，返回 (峰值速度 kB/s, 单次 TCP 建连耗时 ms, 数据中心代码)。
+// 单次建连耗时只供“单 IP 测速”显示，优选结果的 RTT 使用 testRTT 的 3 次稳定性采样。
 func runSpeedTestSimple(ip string, port int, useTLS bool) (int, int, string) {
 	var tcpMs int
+	dialer := &net.Dialer{Timeout: 1 * time.Second}
 	transport := &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			start := time.Now()
-			conn, err := net.Dial("tcp", net.JoinHostPort(ip, strconv.Itoa(port)))
+			conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(ip, strconv.Itoa(port)))
 			if err == nil {
 				tcpMs = int(time.Since(start).Milliseconds())
 			}
@@ -426,7 +503,7 @@ func runSpeedTestSimple(ip string, port int, useTLS bool) (int, int, string) {
 	}
 	client := &http.Client{
 		Transport: transport,
-		Timeout:   5 * time.Second,
+		Timeout:   10 * time.Second,
 	}
 
 	scheme := "http"
@@ -601,6 +678,39 @@ type locationFilter struct {
 	Region         string
 	City           string
 	PreferDuration time.Duration
+}
+
+func maxRTTFromEnv() int {
+	raw := strings.TrimSpace(os.Getenv("BETTER_CF_MAX_RTT_MS"))
+	if raw == "" {
+		return 0
+	}
+	return normalizeMaxRTT(parseIntWithDefault(raw, 200))
+}
+
+func parseIntWithDefault(raw string, fallback int) int {
+	value, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil {
+		return fallback
+	}
+	return value
+}
+
+func normalizeMaxRTT(value int) int {
+	if value < 10 {
+		return 10
+	}
+	if value > 2000 {
+		return 2000
+	}
+	return value
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func locationFilterFromEnv() locationFilter {

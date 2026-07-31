@@ -74,6 +74,7 @@ type Settings struct {
 	UseTLS               bool         `json:"use_tls"`
 	BandwidthMbps        int          `json:"bandwidth_mbps"`
 	RTTConcurrency       int          `json:"rtt_concurrency"`
+	MaxRTTMs             int          `json:"max_rtt_ms"`
 	LocationMode         string       `json:"location_mode,omitempty"`
 	LocationCountry      string       `json:"location_country,omitempty"`
 	LocationRegion       string       `json:"location_region,omitempty"`
@@ -624,6 +625,7 @@ func defaultSettings() Settings {
 		UseTLS:               true,
 		BandwidthMbps:        100,
 		RTTConcurrency:       50,
+		MaxRTTMs:             200,
 		LocationMode:         "any",
 		ScheduleMode:         "daily",
 		ScheduleIntervalDays: 1,
@@ -664,6 +666,10 @@ func (s *Store) applyDefaults() {
 	if s.state.Settings.RTTConcurrency == 0 {
 		s.state.Settings.RTTConcurrency = 50
 	}
+	if s.state.Settings.MaxRTTMs == 0 {
+		s.state.Settings.MaxRTTMs = 200
+	}
+	s.state.Settings.MaxRTTMs = clampInt(s.state.Settings.MaxRTTMs, 10, 2000)
 	s.state.Settings.LocationMode = normalizeLocationMode(s.state.Settings.LocationMode)
 	s.state.Settings.LocationCountry = strings.ToUpper(strings.TrimSpace(s.state.Settings.LocationCountry))
 	s.state.Settings.LocationRegion = strings.TrimSpace(s.state.Settings.LocationRegion)
@@ -1249,6 +1255,7 @@ func (a *App) settings(w http.ResponseWriter, r *http.Request) {
 		next.UseTLS = r.FormValue("use_tls") == "on"
 		next.BandwidthMbps = clampInt(parseInt(r.FormValue("bandwidth_mbps"), 100), 1, 10000)
 		next.RTTConcurrency = clampInt(parseInt(r.FormValue("rtt_concurrency"), 50), 1, 100)
+		next.MaxRTTMs = clampInt(parseInt(r.FormValue("max_rtt_ms"), 200), 10, 2000)
 		next.LocationMode = normalizeLocationMode(r.FormValue("location_mode"))
 		next.LocationCountry = strings.ToUpper(strings.TrimSpace(r.FormValue("location_country")))
 		next.LocationRegion = strings.TrimSpace(r.FormValue("location_region"))
@@ -1610,6 +1617,7 @@ func runBetterIPScan(ctx context.Context, settings Settings, ipVersion int, onLo
 	cmd := exec.CommandContext(ctx, bin)
 	cmd.Dir = scannerWorkDir(bin)
 	cmd.Env = append(os.Environ(),
+		"BETTER_CF_MAX_RTT_MS="+strconv.Itoa(settings.MaxRTTMs),
 		"BETTER_CF_LOCATION_MODE="+normalizeLocationMode(settings.LocationMode),
 		"BETTER_CF_LOCATION_COUNTRY="+strings.TrimSpace(settings.LocationCountry),
 		"BETTER_CF_LOCATION_REGION="+strings.TrimSpace(settings.LocationRegion),
@@ -2694,7 +2702,7 @@ func dnsStatusText(status string) string {
 }
 
 func runSummary(trigger string, settings Settings) string {
-	return fmt.Sprintf("%s / %s / IPv4:%d IPv6:%d / %s / %d Mbps / RTT:%d",
+	return fmt.Sprintf("%s / %s / IPv4:%d IPv6:%d / %s / %d Mbps / RTT并发:%d / 最大RTT:%dms",
 		triggerLabel(trigger),
 		dnsTargetModeLabel(settings.DNSTargetMode),
 		activeIPv4Count(settings),
@@ -2702,6 +2710,7 @@ func runSummary(trigger string, settings Settings) string {
 		locationFilterSummary(settings),
 		settings.BandwidthMbps,
 		settings.RTTConcurrency,
+		settings.MaxRTTMs,
 	)
 }
 
@@ -3037,7 +3046,7 @@ const resultTemplate = `
         <th>协议</th>
         <th>实测带宽</th>
         <th>峰值速度</th>
-        <th>RTT</th>
+        <th>TCP RTT</th>
         <th>机房</th>
         <th>耗时</th>
         <th>DNS</th>
@@ -3203,6 +3212,11 @@ const settingsTemplate = `
       <div>
         <label>RTT 并发数</label>
         <input type="number" name="rtt_concurrency" min="1" max="100" value="{{.Settings.RTTConcurrency}}">
+      </div>
+      <div>
+        <label>最大 TCP RTT (ms)</label>
+        <input type="number" name="max_rtt_ms" min="10" max="2000" value="{{.Settings.MaxRTTMs}}">
+        <span class="muted">默认 200ms；测速前后各采样 3 次，任意样本超限即淘汰。</span>
       </div>
       <div>
         <label>定时运行时间</label>

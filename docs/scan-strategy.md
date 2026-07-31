@@ -8,9 +8,11 @@
 读取 IP 池
 -> 随机生成 100 个测试 IP
 -> RTT 并发测试
+-> 淘汰任意 RTT 样本超过上限的 IP
 -> 保留 RTT 最低的前 10 个
 -> 串行速度测试
--> 找到第一个达到设置带宽的 IP
+-> 对达到设置带宽的 IP 再做 3 次 RTT 复检
+-> 找到带宽与 RTT 都稳定达标的 IP
 -> 输出优选结果
 ```
 
@@ -128,6 +130,7 @@ selected_for_dns
 一个 IP 通过测试的最低标准：
 
 - RTT 测试成功。
+- 测速前后各 3 次 TCP RTT 样本均不超过用户设置的最大 RTT。
 - 能通过 HTTP / HTTPS 请求验证 Cloudflare 响应。
 - `peak_speed_kbps > 0`。
 - `measured_bandwidth_mbps >= configured_bandwidth_mbps`。
@@ -172,7 +175,7 @@ measuredBandwidthMbps := peakSpeedKBps / 128
 
 ### RTT 延迟
 
-TCP 连接耗时，当前 CLI 连续 3 次取平均。
+TCP 连接耗时，不是 ICMP Ping。候选 IP 在下载测速前后各连续测试 3 次；任意样本超过最大 RTT 即淘汰，最终记录两轮中较差的平均值。这样既保留带宽要求，也避免选中瞬时连接快、随后响应明显变慢的 IP。
 
 ### 数据中心
 

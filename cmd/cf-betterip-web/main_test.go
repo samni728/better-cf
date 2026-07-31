@@ -61,3 +61,18 @@ func TestSettingsTemplateParses(t *testing.T) {
 		t.Fatalf("settings template did not parse: %v", err)
 	}
 }
+
+func TestDefaultSettingsIncludesMaxRTT(t *testing.T) {
+	settings := defaultSettings()
+	if settings.MaxRTTMs != 200 {
+		t.Fatalf("default MaxRTTMs = %d, want 200", settings.MaxRTTMs)
+	}
+}
+
+func TestApplyDefaultsMigratesMaxRTT(t *testing.T) {
+	store := &Store{state: AppState{Settings: Settings{}}}
+	store.applyDefaults()
+	if store.state.Settings.MaxRTTMs != 200 {
+		t.Fatalf("migrated MaxRTTMs = %d, want 200", store.state.Settings.MaxRTTMs)
+	}
+}

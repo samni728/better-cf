@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"testing"
 	"time"
 )
@@ -24,5 +25,41 @@ func TestPreferredLocationFilterFallsBack(t *testing.T) {
 	}
 	if filter.Active(10 * time.Minute).Enabled() {
 		t.Fatal("expected preferred filter to fall back at its deadline")
+	}
+}
+
+func TestNormalizeMaxRTT(t *testing.T) {
+	tests := []struct {
+		input int
+		want  int
+	}{
+		{input: 1, want: 10},
+		{input: 180, want: 180},
+		{input: 3000, want: 2000},
+	}
+	for _, tt := range tests {
+		if got := normalizeMaxRTT(tt.input); got != tt.want {
+			t.Fatalf("normalizeMaxRTT(%d) = %d, want %d", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestMaxRTTFromEnv(t *testing.T) {
+	old, existed := os.LookupEnv("BETTER_CF_MAX_RTT_MS")
+	t.Cleanup(func() {
+		if existed {
+			_ = os.Setenv("BETTER_CF_MAX_RTT_MS", old)
+		} else {
+			_ = os.Unsetenv("BETTER_CF_MAX_RTT_MS")
+		}
+	})
+
+	_ = os.Setenv("BETTER_CF_MAX_RTT_MS", "175")
+	if got := maxRTTFromEnv(); got != 175 {
+		t.Fatalf("maxRTTFromEnv() = %d, want 175", got)
+	}
+	_ = os.Setenv("BETTER_CF_MAX_RTT_MS", "invalid")
+	if got := maxRTTFromEnv(); got != 200 {
+		t.Fatalf("maxRTTFromEnv() with invalid input = %d, want 200", got)
 	}
 }
