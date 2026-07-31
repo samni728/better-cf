@@ -7,9 +7,11 @@
 ```text
 读取 IP 池
 -> 随机生成 100 个测试 IP
--> RTT 并发测试
+-> 并发请求测速域名 /cdn-cgi/trace，快速排除无响应 IP 并读取 CF-RAY
+-> 如已选地区，按 CF-RAY 的实测响应机房筛选
+-> 对剩余候选进行 3 次 RTT 稳定性测试
 -> 淘汰任意 RTT 样本超过上限的 IP
--> 保留 RTT 最低的前 10 个
+-> 将全部有效候选按 RTT 从低到高排序
 -> 串行速度测试
 -> 对达到设置带宽的 IP 再做 3 次 RTT 复检
 -> 找到带宽与 RTT 都稳定达标的 IP
@@ -91,21 +93,20 @@ selected_for_dns
 严格地区：只测试目标地区，不自动回退；单个协议族连续 30 分钟没有新增有效 IP 时任务失败
 ```
 
-地区筛选在候选 IP 生成前完成：
+地区筛选在候选 IP 实测响应后完成：
 
 ```text
-读取 local-ip-ranges.csv
--> 按 IPv4 / IPv6 过滤
--> 按国家过滤（例如 CN / JP）
--> 按区域过滤（例如 CN-GD / JP-13）
--> 按城市过滤（例如 Guangzhou / Tokyo）
--> 从符合条件的 CIDR 内随机生成候选 IP
--> RTT 和速度测试
+读取原版 ips-v4.txt / ips-v6.txt
+-> 从 Cloudflare Anycast 地址池随机生成候选 IP
+-> 快速请求测速域名并读取 CF-RAY
+-> 用 locations.json 把 CF-RAY 机房码转换为国家 / Cloudflare 大区 / 城市
+-> 按用户选择过滤实际响应机房
+-> 对匹配候选进行 3 次 RTT 稳定性测试和下载测速
 ```
 
-`CF-RAY` 仍用于记录本次测速实际响应的 Cloudflare 机房，但不再用作 IP 网段地区筛选条件。Cloudflare 是 Anycast 网络，网段的 GeoFeed 标签与当次实际响应机房可能不同，WebUI 会分别保留这两类信息。
+`local-ip-ranges.csv` 是 Cloudflare GeoFeed 地理标注数据，不是原版 better-cloudflare-ip 的可测 CDN 候选池。将它直接用于生成候选，会产生大量无法响应当前测速域名的 IP。Cloudflare 是 Anycast 网络，同一 IP 从不同测试机出发可能路由到不同机房，所以“日本”等条件必须以当次响应的 `CF-RAY` 为准。
 
-WebUI 会实时显示当前国家、区域和城市匹配的 IPv4 / IPv6 CIDR 数量。更改地区或模式后必须保存配置，后续“立即执行”和定时任务才会使用新值；每条运行记录会显示任务创建时冻结的实际配置。
+WebUI 会实时显示当前国家、大区和城市匹配的 Cloudflare 响应机房数量与 IATA 代码。更改地区或模式后必须保存配置，后续“立即执行”和定时任务才会使用新值；每条运行记录会显示任务创建时冻结的实际配置。
 
 ### 重测当前 IP
 

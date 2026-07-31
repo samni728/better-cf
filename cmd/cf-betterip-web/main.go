@@ -35,7 +35,7 @@ type App struct {
 	tasks        *TaskManager
 	dataDir      string
 	geoMu        sync.RWMutex
-	geoLocations []geodb.Location
+	geoLocations []GeoLocation
 	geoDatabase  GeoDatabaseStatus
 }
 
@@ -121,9 +121,8 @@ type RunRecord struct {
 }
 
 type GeoFilterStats struct {
-	IPv4Count int
-	IPv6Count int
-	Total     int
+	DataCenterCount int
+	Codes           string
 }
 
 type RunLog struct {
@@ -187,7 +186,7 @@ type PageData struct {
 	GeoCountries        []GeoChoice
 	GeoRegions          []GeoChoice
 	GeoCities           []GeoChoice
-	GeoLocations        []geodb.Location
+	GeoLocations        []GeoLocation
 	GeoDatabase         GeoDatabaseStatus
 	GeoFilterStats      GeoFilterStats
 	FamilyNoResultLimit string
@@ -307,13 +306,13 @@ func main() {
 	}
 
 	dataCenterLocations := loadGeoLocations(*dataDir)
-	geoEntries := loadGeoDatabase(*dataDir)
+	_ = loadGeoDatabase(*dataDir) // 保留 GeoFeed 缓存用于数据库更新/研究，不再作为可测候选池。
 	app := &App{
 		store:        store,
 		sessions:     &SessionStore{sessions: make(map[string]string)},
 		tasks:        &TaskManager{cancels: make(map[string]context.CancelFunc)},
 		dataDir:      *dataDir,
-		geoLocations: geodb.Locations(geoEntries),
+		geoLocations: dataCenterLocations,
 		geoDatabase:  readGeoDatabaseStatus(*dataDir, len(dataCenterLocations)),
 	}
 	go app.schedulerLoop()
@@ -516,7 +515,10 @@ func atomicWriteFile(path string, data []byte) error {
 }
 
 func readGeoDatabaseStatus(dataDir string, locationCount int) GeoDatabaseStatus {
-	status := GeoDatabaseStatus{LocationCount: locationCount}
+	status := GeoDatabaseStatus{LocationCount: locationCount, Ready: locationCount > 0}
+	if info, err := os.Stat(filepath.Join(dataDir, "locations.json")); err == nil {
+		status.UpdatedAt = info.ModTime().Format("2006-01-02 15:04:05")
+	}
 	path := filepath.Join(dataDir, "local-ip-ranges.csv")
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -527,17 +529,18 @@ func readGeoDatabaseStatus(dataDir string, locationCount int) GeoDatabaseStatus 
 		return status
 	}
 	status.GeoFeedCount = count
-	status.Ready = count > 0
-	if info, err := os.Stat(path); err == nil {
-		status.UpdatedAt = info.ModTime().Format("2006-01-02 15:04:05")
+	if status.UpdatedAt == "" {
+		if info, err := os.Stat(path); err == nil {
+			status.UpdatedAt = info.ModTime().Format("2006-01-02 15:04:05")
+		}
 	}
 	return status
 }
 
-func (a *App) geoSnapshot() ([]geodb.Location, GeoDatabaseStatus) {
+func (a *App) geoSnapshot() ([]GeoLocation, GeoDatabaseStatus) {
 	a.geoMu.RLock()
 	defer a.geoMu.RUnlock()
-	locations := append([]geodb.Location(nil), a.geoLocations...)
+	locations := append([]GeoLocation(nil), a.geoLocations...)
 	return locations, a.geoDatabase
 }
 
@@ -556,30 +559,35 @@ func (a *App) updateGeoDatabase() (GeoDatabaseStatus, error) {
 	if err != nil {
 		return GeoDatabaseStatus{}, err
 	}
-	geoEntries, err := geodb.Parse(bytes.NewReader(geoFeedData))
-	if err != nil {
-		return GeoDatabaseStatus{}, fmt.Errorf("解析 GeoFeed 失败: %w", err)
-	}
 	if err := atomicWriteFile(filepath.Join(a.dataDir, "local-ip-ranges.csv"), geoFeedData); err != nil {
 		return GeoDatabaseStatus{}, fmt.Errorf("更新 GeoFeed 失败: %w", err)
 	}
 	_, currentStatus := a.geoSnapshot()
 	locationCount := currentStatus.LocationCount
+	var dataCenterLocations []GeoLocation
 	if locationsData, downloadErr := downloadData(client, locationsSourceURL, 8*1024*1024); downloadErr == nil {
 		if locations := parseGeoLocations(locationsData); len(locations) >= 100 {
 			if writeErr := atomicWriteFile(filepath.Join(a.dataDir, "locations.json"), locationsData); writeErr == nil {
 				locationCount = len(locations)
+				dataCenterLocations = locations
 			}
 		}
+	}
+	if len(dataCenterLocations) == 0 {
+		dataCenterLocations = loadGeoLocations(a.dataDir)
+		locationCount = len(dataCenterLocations)
+	}
+	if locationCount == 0 {
+		return GeoDatabaseStatus{}, fmt.Errorf("更新 GeoFeed 成功，但 Cloudflare 响应机房数据不可用")
 	}
 	status := GeoDatabaseStatus{
 		LocationCount: locationCount,
 		GeoFeedCount:  geoFeedCount,
 		UpdatedAt:     time.Now().Format("2006-01-02 15:04:05"),
-		Ready:         true,
+		Ready:         locationCount > 0,
 	}
 	a.geoMu.Lock()
-	a.geoLocations = geodb.Locations(geoEntries)
+	a.geoLocations = dataCenterLocations
 	a.geoDatabase = status
 	a.geoMu.Unlock()
 	return status, nil
@@ -1191,7 +1199,7 @@ func (a *App) refreshGeoDatabase(w http.ResponseWriter, r *http.Request) {
 	a.render(w, settingsTemplate, data)
 }
 
-func buildGeoChoices(locations []geodb.Location, settings Settings) ([]GeoChoice, []GeoChoice, []GeoChoice) {
+func buildGeoChoices(locations []GeoLocation, settings Settings) ([]GeoChoice, []GeoChoice, []GeoChoice) {
 	countries := make(map[string]bool)
 	regions := make(map[string]bool)
 	cities := make(map[string]bool)
@@ -1213,8 +1221,9 @@ func buildGeoChoices(locations []geodb.Location, settings Settings) ([]GeoChoice
 	return geoChoices(countries, settings.LocationCountry), geoChoices(regions, settings.LocationRegion), geoChoices(cities, settings.LocationCity)
 }
 
-func calculateGeoFilterStats(locations []geodb.Location, settings Settings) GeoFilterStats {
+func calculateGeoFilterStats(locations []GeoLocation, settings Settings) GeoFilterStats {
 	stats := GeoFilterStats{}
+	var codes []string
 	for _, loc := range locations {
 		if settings.LocationCountry != "" && !strings.EqualFold(settings.LocationCountry, loc.Country) {
 			continue
@@ -1225,10 +1234,11 @@ func calculateGeoFilterStats(locations []geodb.Location, settings Settings) GeoF
 		if settings.LocationCity != "" && !strings.EqualFold(settings.LocationCity, loc.City) {
 			continue
 		}
-		stats.IPv4Count += loc.IPv4Count
-		stats.IPv6Count += loc.IPv6Count
+		stats.DataCenterCount++
+		codes = append(codes, loc.IATA)
 	}
-	stats.Total = stats.IPv4Count + stats.IPv6Count
+	sort.Strings(codes)
+	stats.Codes = strings.Join(codes, " / ")
 	return stats
 }
 
@@ -1299,9 +1309,9 @@ func (a *App) settings(w http.ResponseWriter, r *http.Request) {
 			next.LocationMode = "any"
 		}
 		geoStats := a.geoFilterStats(next)
-		if next.LocationMode != "any" && geoStats.Total == 0 {
+		if next.LocationMode != "any" && geoStats.DataCenterCount == 0 {
 			data = a.pageData("配置", user, next)
-			data.Error = "所选地区在当前数据库中没有匹配的 IPv4 或 IPv6 网段，配置尚未保存。请调整国家、区域或城市。"
+			data.Error = "所选地区在当前 Cloudflare 机房数据库中没有可匹配的实际响应机房，配置尚未保存。请重新选择国家、区域或城市。"
 			a.render(w, settingsTemplate, data)
 			return
 		}
@@ -1590,7 +1600,7 @@ func (a *App) collectFamilyResults(ctx context.Context, id string, settings Sett
 
 		resultDeadline := lastResultAt.Add(noResultTimeout)
 		attemptCtx, cancel := context.WithDeadline(ctx, resultDeadline)
-		result, output, err := runBetterIPScan(attemptCtx, settings, ipVersion, a.geoDatabasePath(), func(message string) {
+		result, output, err := runBetterIPScan(attemptCtx, settings, ipVersion, func(message string) {
 			a.store.appendRunLog(id, "info", message)
 		})
 		cancel()
@@ -1605,7 +1615,11 @@ func (a *App) collectFamilyResults(ctx context.Context, id string, settings Sett
 				return results, err
 			}
 			if errors.Is(err, context.DeadlineExceeded) || time.Now().After(resultDeadline) {
-				return results, fmt.Errorf("IPv%d 连续 %s 没有新增有效 IP，已自动停止该任务；如果 VPS 不支持 IPv%d，请把 IPv%d 数量设置为 0 后重新执行", ipVersion, formatDuration(noResultTimeout), ipVersion, ipVersion)
+				detail := "请检查 VPS 的该协议族连通性、最大 RTT 和带宽门槛"
+				if normalizeLocationMode(settings.LocationMode) != "any" {
+					detail = "本任务按 CF-RAY 筛选实际响应机房；当前 VPS 路由可能无法到达所选机房，也可能是 RTT 或带宽未达标"
+				}
+				return results, fmt.Errorf("IPv%d 连续 %s 没有新增有效 IP，已自动停止该任务；%s", ipVersion, formatDuration(noResultTimeout), detail)
 			}
 			a.store.appendRunLog(id, "error", fmt.Sprintf("IPv%d 第 %d 次尝试失败：%v", ipVersion, attempt, err))
 			continue
@@ -1644,15 +1658,7 @@ func (a *App) collectFamilyResults(ctx context.Context, id string, settings Sett
 	return results, nil
 }
 
-func (a *App) geoDatabasePath() string {
-	path := filepath.Join(a.dataDir, "local-ip-ranges.csv")
-	if absolute, err := filepath.Abs(path); err == nil {
-		return absolute
-	}
-	return path
-}
-
-func runBetterIPScan(ctx context.Context, settings Settings, ipVersion int, geoDatabasePath string, onLog func(string)) (IPTestResult, string, error) {
+func runBetterIPScan(ctx context.Context, settings Settings, ipVersion int, onLog func(string)) (IPTestResult, string, error) {
 	bin, err := findScannerBinary()
 	if err != nil {
 		return IPTestResult{}, "", err
@@ -1673,7 +1679,6 @@ func runBetterIPScan(ctx context.Context, settings Settings, ipVersion int, geoD
 	cmd.Dir = scannerWorkDir(bin)
 	cmd.Env = append(os.Environ(),
 		"BETTER_CF_MAX_RTT_MS="+strconv.Itoa(settings.MaxRTTMs),
-		"BETTER_CF_GEO_DB_PATH="+strings.TrimSpace(geoDatabasePath),
 		"BETTER_CF_LOCATION_MODE="+normalizeLocationMode(settings.LocationMode),
 		"BETTER_CF_LOCATION_COUNTRY="+strings.TrimSpace(settings.LocationCountry),
 		"BETTER_CF_LOCATION_REGION="+strings.TrimSpace(settings.LocationRegion),
@@ -2002,11 +2007,14 @@ func locationFilterSummaryWithStats(settings Settings, stats GeoFilterStats) str
 	if normalizeLocationMode(settings.LocationMode) == "any" || locationSelectionText(settings) == "" {
 		return base
 	}
-	counts := fmt.Sprintf("IPv4 %d 段，IPv6 %d 段", stats.IPv4Count, stats.IPv6Count)
-	if normalizeLocationMode(settings.LocationMode) == "strict" {
-		return fmt.Sprintf("%s（%s；不回退全局）", base, counts)
+	targets := fmt.Sprintf("目标机房 %d 个", stats.DataCenterCount)
+	if stats.Codes != "" {
+		targets += "：" + stats.Codes
 	}
-	return fmt.Sprintf("%s（%s；单次选优连续 10 分钟无结果后回退全局）", base, counts)
+	if normalizeLocationMode(settings.LocationMode) == "strict" {
+		return fmt.Sprintf("%s（%s；只接受 CF-RAY 实测匹配；不回退全局）", base, targets)
+	}
+	return fmt.Sprintf("%s（%s；先接受 CF-RAY 实测匹配；单次选优连续 10 分钟无结果后回退全局）", base, targets)
 }
 
 func activeIPv4Count(settings Settings) int {
@@ -3230,14 +3238,14 @@ const settingsTemplate = `
     </div>
 
     <h2 style="margin-top:22px">地区筛选</h2>
-    <p class="muted">先从 Cloudflare IP 地区网段数据库中按国家、区域和城市筛选 CIDR，再从这些网段中生成 IPv4 / IPv6 候选 IP 测速。<code>CF-RAY</code> 只用于展示实际响应机房。</p>
+    <p class="muted">候选 IPv4 / IPv6 始终从原版 better-cloudflare-ip 的 Cloudflare Anycast 地址池生成。程序先快速请求测速域名，再根据响应头 <code>CF-RAY</code> 的实测机房按国家、区域和城市筛选；不再把 GeoFeed 地理标签网段误当成可测 CDN 地址池。</p>
     <div class="row" style="margin-bottom:12px">
       {{if .GeoDatabase.Ready}}
-        <span class="muted">数据库已就绪：{{.GeoDatabase.GeoFeedCount}} 条 IP 网段，更新于 {{.GeoDatabase.UpdatedAt}}</span>
+        <span class="muted">数据库已就绪：{{.GeoDatabase.LocationCount}} 个 Cloudflare 响应机房，更新于 {{.GeoDatabase.UpdatedAt}}</span>
       {{else}}
-        <span class="muted">地区 IP 网段数据库尚未下载，请先点击更新。</span>
+        <span class="muted">Cloudflare 响应机房数据库尚未下载，请先点击更新。</span>
       {{end}}
-      <button type="submit" class="ghost" formaction="/settings/geo-refresh" formmethod="post">更新地区 IP 数据库</button>
+      <button type="submit" class="ghost" formaction="/settings/geo-refresh" formmethod="post">更新地区 / 机房数据库</button>
     </div>
     <div class="grid">
       <label class="metric checkbox">
@@ -3246,11 +3254,11 @@ const settingsTemplate = `
       </label>
       <label class="metric checkbox">
         <input type="radio" name="location_mode" value="prefer" {{if eq .Settings.LocationMode "prefer"}}checked{{end}}>
-        <span><strong>所选地区优先</strong><br><span class="muted">每次选优先在所选网段重试；连续 10 分钟没有结果才回退全球。</span></span>
+        <span><strong>所选实测机房优先</strong><br><span class="muted">先只接受 <code>CF-RAY</code> 实测落在所选机房的 IP；连续 10 分钟没有结果才回退全球。</span></span>
       </label>
       <label class="metric checkbox">
         <input type="radio" name="location_mode" value="strict" {{if eq .Settings.LocationMode "strict"}}checked{{end}}>
-        <span><strong>仅测试所选地区</strong><br><span class="muted">始终只测所选网段，不回退全球；连续 {{.FamilyNoResultLimit}} 无新增结果则该协议族任务失败。</span></span>
+        <span><strong>仅接受所选实测机房</strong><br><span class="muted">候选仍来自原版全局池，但只接受 <code>CF-RAY</code> 落在所选机房的结果，绝不回退；连续 {{.FamilyNoResultLimit}} 无新增结果则失败。</span></span>
       </label>
     </div>
     <div class="grid">
@@ -3262,7 +3270,7 @@ const settingsTemplate = `
         </select>
       </div>
       <div>
-        <label for="location-region">区域 / 省级代码（GeoFeed）</label>
+        <label for="location-region">Cloudflare 大区</label>
         <select id="location-region" name="location_region">
           <option value="">所有区域</option>
           {{range .GeoRegions}}<option value="{{.Value}}" {{if .Selected}}selected{{end}}>{{.Label}}</option>{{end}}
@@ -3279,12 +3287,12 @@ const settingsTemplate = `
     <div class="metric" id="geo-selection-status" style="margin-top:12px">
       <span id="geo-save-state">当前已保存配置</span>
       <strong id="geo-effective-summary">{{.LocationSummary}}</strong>
-      <p id="geo-prefix-counts">当前选择匹配 IPv4 {{.GeoFilterStats.IPv4Count}} 条网段、IPv6 {{.GeoFilterStats.IPv6Count}} 条网段，共 {{.GeoFilterStats.Total}} 条。</p>
-      <p class="muted">这里统计的是 Cloudflare GeoFeed 的网段标签；实际请求最终响应的机房仍以测试结果中的 <code>CF-RAY</code> 为准，Anycast 路由可能到达其他机房。</p>
+      <p id="geo-prefix-counts">当前选择匹配 {{.GeoFilterStats.DataCenterCount}} 个实际响应机房{{if .GeoFilterStats.Codes}}：{{.GeoFilterStats.Codes}}{{end}}。</p>
+      <p class="muted">Anycast IP 本身没有固定的“日本 IP”或“广州 IP”；同一 IP 从不同网络出发可能到达不同机房。这里筛选的是当前 VPS 实际请求后 <code>CF-RAY</code> 报告的响应机房。</p>
       <button type="submit">保存地区筛选和全部配置</button>
     </div>
     <div id="geo-location-source" hidden>
-      {{range .GeoLocations}}<span data-country="{{.Country}}" data-region="{{.Region}}" data-city="{{.City}}" data-v4="{{.IPv4Count}}" data-v6="{{.IPv6Count}}"></span>{{end}}
+      {{range .GeoLocations}}<span data-country="{{.Country}}" data-region="{{.Region}}" data-city="{{.City}}" data-code="{{.IATA}}"></span>{{end}}
     </div>
 
     <h2 style="margin-top:22px">扫描参数</h2>
@@ -3355,8 +3363,7 @@ const settingsTemplate = `
         country: node.dataset.country,
         region: node.dataset.region,
         city: node.dataset.city,
-        v4: parseInt(node.dataset.v4 || "0", 10),
-        v6: parseInt(node.dataset.v6 || "0", 10)
+        code: node.dataset.code
       };
     });
     if (!country || !region || !city || source.length === 0) return;
@@ -3414,17 +3421,14 @@ const settingsTemplate = `
     function updateSelectionStatus(changed) {
       var path = selectedPath();
       var mode = selectedMode();
-      var counts = source.filter(function (item) {
+	  var matches = source.filter(function (item) {
         return (!country.value || item.country === country.value) &&
           (!region.value || item.region === region.value) &&
           (!city.value || item.city === city.value);
-      }).reduce(function (sum, item) {
-        sum.v4 += item.v4;
-        sum.v6 += item.v6;
-        return sum;
-      }, {v4: 0, v6: 0});
+      });
       if (prefixCounts) {
-        prefixCounts.textContent = "当前选择匹配 IPv4 " + counts.v4 + " 条网段、IPv6 " + counts.v6 + " 条网段，共 " + (counts.v4 + counts.v6) + " 条。";
+		var codes = matches.map(function (item) { return item.code; }).filter(Boolean).sort();
+        prefixCounts.textContent = "当前选择匹配 " + matches.length + " 个实际响应机房" + (codes.length ? "：" + codes.join(" / ") : "") + "。";
       }
       if (effectiveSummary) {
         if (mode === "any") {
@@ -3432,9 +3436,9 @@ const settingsTemplate = `
             ? "全局随机；已选择的 " + path + " 当前不会参与筛选"
             : "全局随机；从全球 IP 池抽取";
         } else if (mode === "prefer") {
-          effectiveSummary.textContent = "所选地区优先：" + (path || "尚未选择地区") + "；10 分钟无结果后回退全球";
+		  effectiveSummary.textContent = "所选实测机房优先：" + (path || "尚未选择地区") + "；按 CF-RAY 判定；10 分钟无结果后回退全球";
         } else {
-          effectiveSummary.textContent = "仅测试所选地区：" + (path || "尚未选择地区") + "；绝不回退全球";
+		  effectiveSummary.textContent = "仅接受所选实测机房：" + (path || "尚未选择地区") + "；按 CF-RAY 判定；绝不回退全球";
         }
       }
       if (changed && saveState) {

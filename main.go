@@ -10,7 +10,6 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
-	"net/netip"
 	"os"
 	"path/filepath"
 	"sort"
@@ -18,8 +17,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"cf-betterip-ser/internal/geodb"
 )
 
 // 命令行版本的入口
@@ -177,20 +174,13 @@ func cloudflareTest(ipType int, useTLS bool, taskNum int, speed int, maxRTTMs in
 		return "", 0, 0, ""
 	}
 	ipList := parseIPList(content)
-	var geoPrefixes []netip.Prefix
+	if len(ipList) == 0 {
+		fmt.Printf("原版 IPv%d 地址池为空。\n", ipType)
+		return "", 0, 0, ""
+	}
+	fmt.Printf("已加载原版 IPv%d Cloudflare Anycast 地址池，共 %d 个子网。\n", ipType, len(ipList))
 	if filter.Enabled() {
-		geoPrefixes, err = loadGeoPrefixes(ipType, filter)
-		if err != nil {
-			fmt.Println("读取地区 IP 网段数据库失败:", err)
-			return "", 0, 0, ""
-		}
-		if len(geoPrefixes) == 0 {
-			fmt.Printf("数据库中没有符合 %s 的 IPv%d 网段。\n", filter.Summary(), ipType)
-			return "", 0, 0, ""
-		}
-		fmt.Printf("已从地区数据库筛选出 %d 个 IPv%d 网段。\n", len(geoPrefixes), ipType)
-	} else {
-		fmt.Printf("正在从 %d 个全局子网中随机生成 IP...\n", len(ipList))
+		fmt.Printf("候选 IP 仍从原版地址池生成；实际响应机房将根据 CF-RAY 按 %s 筛选。\n", filter.Summary())
 	}
 
 	sampleSize := 100
@@ -208,26 +198,25 @@ func cloudflareTest(ipType int, useTLS bool, taskNum int, speed int, maxRTTMs in
 		}
 		var rttResults []RTTResult
 		for {
+			sampled := randomSample(ipList, sampleSize)
 			var testIPs []string
-			if activeFilter.Enabled() {
-				sampled := randomSamplePrefixes(geoPrefixes, sampleSize)
-				testIPs = getRandomIPsFromPrefixes(sampled)
+			if ipType == 6 {
+				testIPs = getRandomIPv6s(sampled)
 			} else {
-				sampled := randomSample(ipList, sampleSize)
-				if ipType == 6 {
-					testIPs = getRandomIPv6s(sampled)
-				} else {
-					testIPs = getRandomIPv4s(sampled)
-				}
+				testIPs = getRandomIPv4s(sampled)
 			}
 
-			fmt.Printf("已生成 %d 个测试 IP，开始 RTT 测试...\n", len(testIPs))
+			fmt.Printf("已从原版地址池生成 %d 个候选 IP，先进行快速响应和机房检测...\n", len(testIPs))
 
-			rttResults = runRTTTest(testIPs, taskNum, useTLS, maxRTTMs)
+			rttResults = runRTTTest(testIPs, taskNum, useTLS, maxRTTMs, activeFilter)
 			if len(rttResults) > 0 {
 				break
 			}
-			fmt.Println("当前所有 IP 都存在 RTT 丢包，继续新的 RTT 测试...")
+			if activeFilter.Enabled() {
+				fmt.Printf("本轮没有符合 %s 且 RTT 达标的响应 IP，继续从原版地址池换一批候选...\n", activeFilter.Summary())
+			} else {
+				fmt.Println("本轮没有 RTT 达标的 Cloudflare 响应 IP，继续换一批候选...")
+			}
 			activeFilter = filter.Active(time.Since(filterStartedAt))
 		}
 
@@ -273,6 +262,10 @@ func cloudflareTest(ipType int, useTLS bool, taskNum int, speed int, maxRTTMs in
 				fmt.Printf("跳过 %s：初筛机房 %s 与复检机房 %s 不一致，路由不稳定。\n", r.IP, r.DataCenterCode, postDC)
 				continue
 			}
+			if activeFilter.Enabled() && !activeFilter.MatchesDataCenter(postDC) {
+				fmt.Printf("跳过 %s：下载后实测机房 %s 已不符合 %s。\n", r.IP, postDC, activeFilter.Summary())
+				continue
+			}
 			stableAvgMs := maxInt(r.LatencyMs, postAvgMs)
 			stableMaxMs := maxInt(r.MaxLatencyMs, postMaxMs)
 			fmt.Printf("%s RTT 复检：初筛平均 %d ms / 最大 %d ms，下载后平均 %d ms / 最大 %d ms。\n",
@@ -288,28 +281,6 @@ func cloudflareTest(ipType int, useTLS bool, taskNum int, speed int, maxRTTMs in
 		}
 		fmt.Println("当前所有 IP 都未达到期望带宽，重新开始新一轮测试...")
 	}
-}
-
-func randomSamplePrefixes(list []netip.Prefix, n int) []netip.Prefix {
-	shuffled := append([]netip.Prefix(nil), list...)
-	randomMu.Lock()
-	randomGenerator.Shuffle(len(shuffled), func(i, j int) {
-		shuffled[i], shuffled[j] = shuffled[j], shuffled[i]
-	})
-	randomMu.Unlock()
-	if n > len(shuffled) {
-		n = len(shuffled)
-	}
-	return shuffled[:n]
-}
-
-func getRandomIPsFromPrefixes(prefixes []netip.Prefix) []string {
-	result := make([]string, 0, len(prefixes))
-	for _, prefix := range prefixes {
-		addr := geodb.RandomAddr(prefix, func() byte { return byte(nextRandomIntn(256)) })
-		result = append(result, addr.String())
-	}
-	return result
 }
 
 // randomSample 从列表中随机抽取 n 个元素
@@ -336,19 +307,37 @@ type RTTResult struct {
 }
 
 // runRTTTest 运行 RTT 测试（并发，带进度显示）
-func runRTTTest(ipList []string, taskNum int, useTLS bool, maxRTTMs int) []RTTResult {
+func runRTTTest(ipList []string, taskNum int, useTLS bool, maxRTTMs int, filter locationFilter) []RTTResult {
+	if len(ipList) == 0 {
+		return nil
+	}
 	if len(ipList) < taskNum {
 		taskNum = len(ipList)
 	}
 
+	// 第一阶段只请求一次 /cdn-cgi/trace。无响应、非目标机房和 RTT 超限的
+	// 候选不会再进行 3 次稳定性采样，这与原版“快速找到有响应 IP 再精测”的顺序一致。
+	probeResults, responding, wrongLocation, highRTT := runResponseProbe(ipList, taskNum, useTLS, maxRTTMs, filter)
+	if filter.Enabled() {
+		fmt.Printf("快速检测完成：%d/%d 个 IP 响应 Cloudflare，%d 个实际机房不符合所选地区，%d 个首次 RTT 超限，%d 个进入稳定性测试。\n",
+			responding, len(ipList), wrongLocation, highRTT, len(probeResults))
+	} else {
+		fmt.Printf("快速检测完成：%d/%d 个 IP 响应 Cloudflare，%d 个首次 RTT 超限，%d 个进入稳定性测试。\n",
+			responding, len(ipList), highRTT, len(probeResults))
+	}
+	if len(probeResults) == 0 {
+		return nil
+	}
+
 	var wg sync.WaitGroup
-	resultChan := make(chan RTTResult, len(ipList))
+	resultChan := make(chan RTTResult, len(probeResults))
 	thread := make(chan struct{}, taskNum)
 	var count int
 	var mu sync.Mutex
-	total := len(ipList)
+	total := len(probeResults)
 
-	for _, ip := range ipList {
+	for _, probe := range probeResults {
+		ip := probe.IP
 		wg.Add(1)
 		thread <- struct{}{}
 		go func(ip string) {
@@ -360,12 +349,12 @@ func runRTTTest(ipList []string, taskNum int, useTLS bool, maxRTTMs int) []RTTRe
 				current := count
 				mu.Unlock()
 				if current%10 == 0 || current == total {
-					fmt.Printf("RTT 测试进度: %d/%d\n", current, total)
+					fmt.Printf("RTT 稳定性测试进度: %d/%d\n", current, total)
 				}
 			}()
 
 			avgMs, maxMs, dc := testRTT(ip, useTLS)
-			if avgMs > 0 {
+			if avgMs > 0 && (!filter.Enabled() || filter.MatchesDataCenter(dc)) {
 				resultChan <- RTTResult{IP: ip, LatencyMs: avgMs, MaxLatencyMs: maxMs, DataCenterCode: dc}
 			}
 		}(ip)
@@ -386,82 +375,81 @@ func runRTTTest(ipList []string, taskNum int, useTLS bool, maxRTTMs int) []RTTRe
 		results = append(results, r)
 	}
 	if skippedHighRTT > 0 {
-		fmt.Printf("RTT 初筛跳过 %d 个超过 %d ms 上限的 IP。\n", skippedHighRTT, maxRTTMs)
+		fmt.Printf("RTT 稳定性测跳过 %d 个超过 %d ms 上限的 IP。\n", skippedHighRTT, maxRTTMs)
 	}
 
-	// 按最小延迟排序，最多保留前 10 个进入速度测试
+	// 与原 Shell 版一致：不只截取前 10 个，所有稳定候选按延迟排序后逐个测速。
 	sort.Slice(results, func(i, j int) bool {
 		if results[i].LatencyMs == results[j].LatencyMs {
 			return results[i].MaxLatencyMs < results[j].MaxLatencyMs
 		}
 		return results[i].LatencyMs < results[j].LatencyMs
 	})
-
-	if len(results) > 10 {
-		fmt.Printf("RTT 测试完成，%d/%d 个 IP 有效，保留延迟最低的 10 个\n", len(results), total)
-		results = results[:10]
-	} else {
-		fmt.Printf("RTT 测试完成，%d/%d 个 IP 有效\n", len(results), total)
-	}
+	fmt.Printf("RTT 稳定性测试完成，%d/%d 个 IP 有效，将按延迟从低到高逐个测速。\n", len(results), total)
 	return results
+}
+
+func runResponseProbe(ipList []string, taskNum int, useTLS bool, maxRTTMs int, filter locationFilter) ([]RTTResult, int, int, int) {
+	var wg sync.WaitGroup
+	type probeResult struct {
+		RTTResult
+		responded     bool
+		wrongLocation bool
+		highRTT       bool
+	}
+	resultChan := make(chan probeResult, len(ipList))
+	thread := make(chan struct{}, taskNum)
+	for _, ip := range ipList {
+		wg.Add(1)
+		thread <- struct{}{}
+		go func(ip string) {
+			defer func() { <-thread; wg.Done() }()
+			latencyMs, dc := testRTTSample(ip, useTLS)
+			if latencyMs <= 0 {
+				resultChan <- probeResult{}
+				return
+			}
+			result := probeResult{RTTResult: RTTResult{IP: ip, LatencyMs: latencyMs, MaxLatencyMs: latencyMs, DataCenterCode: dc}, responded: true}
+			if filter.Enabled() && !filter.MatchesDataCenter(dc) {
+				result.wrongLocation = true
+			} else if maxRTTMs > 0 && latencyMs > maxRTTMs {
+				result.highRTT = true
+			}
+			resultChan <- result
+		}(ip)
+	}
+	go func() { wg.Wait(); close(resultChan) }()
+
+	var candidates []RTTResult
+	responding, wrongLocation, highRTT := 0, 0, 0
+	for result := range resultChan {
+		if !result.responded {
+			continue
+		}
+		responding++
+		if result.wrongLocation {
+			wrongLocation++
+			continue
+		}
+		if result.highRTT {
+			highRTT++
+			continue
+		}
+		candidates = append(candidates, result.RTTResult)
+	}
+	return candidates, responding, wrongLocation, highRTT
 }
 
 // testRTT 测试单个 IP 的 RTT（TCP 连接 + 验证 CF-RAY）。
 // 与原 Shell 版保持一致：使用实际测速域名的 /cdn-cgi/trace，
 // 连续 3 次取 TCP 建连时间，任意一次失败或机房漂移就丢弃。
 func testRTT(ip string, useTLS bool) (int, int, string) {
-	port := 80
-	if useTLS {
-		port = 443
-	}
-
 	var totalMs int
 	maxMs := 0
 	dataCenterCode := ""
 	for range 3 {
-		start := time.Now()
-		conn, err := net.DialTimeout("tcp", net.JoinHostPort(ip, strconv.Itoa(port)), 1*time.Second)
-		if err != nil {
-			return 0, 0, ""
-		}
-		tcpDuration := time.Since(start)
-
-		conn.SetDeadline(time.Now().Add(3 * time.Second))
-
-		var rwc net.Conn = conn
-		if useTLS {
-			tlsConn := tls.Client(conn, &tls.Config{ServerName: speedTestDomain})
-			if err := tlsConn.Handshake(); err != nil {
-				conn.Close()
-				return 0, 0, ""
-			}
-			rwc = tlsConn
-		}
-
-		requestTarget := "/cdn-cgi/trace"
-		if !useTLS {
-			requestTarget = "http://" + speedTestDomain + requestTarget
-		}
-		reqStr := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n", requestTarget, speedTestDomain)
-		_, err = rwc.Write([]byte(reqStr))
-		if err != nil {
-			rwc.Close()
-			return 0, 0, ""
-		}
-
-		reader := bufio.NewReader(rwc)
-		resp, err := http.ReadResponse(reader, nil)
-		rwc.Close()
-		if err != nil {
-			return 0, 0, ""
-		}
-		resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			return 0, 0, ""
-		}
-
-		colo := extractDataCenter(resp.Header.Get("CF-RAY"))
-		if colo == "" {
+		sampleMs, colo := testRTTSample(ip, useTLS)
+		if sampleMs <= 0 || colo == "" {
 			return 0, 0, ""
 		}
 		if dataCenterCode == "" {
@@ -470,10 +458,6 @@ func testRTT(ip string, useTLS bool) (int, int, string) {
 			return 0, 0, ""
 		}
 
-		sampleMs := int(tcpDuration.Milliseconds())
-		if sampleMs < 1 {
-			sampleMs = 1
-		}
 		totalMs += sampleMs
 		if sampleMs > maxMs {
 			maxMs = sampleMs
@@ -481,6 +465,58 @@ func testRTT(ip string, useTLS bool) (int, int, string) {
 	}
 
 	return totalMs / 3, maxMs, dataCenterCode
+}
+
+// testRTTSample 对实际测速域名发起一次请求，返回 TCP 建连时间和 CF-RAY 机房码。
+func testRTTSample(ip string, useTLS bool) (int, string) {
+	port := 80
+	if useTLS {
+		port = 443
+	}
+	start := time.Now()
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(ip, strconv.Itoa(port)), time.Second)
+	if err != nil {
+		return 0, ""
+	}
+	tcpDuration := time.Since(start)
+	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+
+	var rwc net.Conn = conn
+	if useTLS {
+		tlsConn := tls.Client(conn, &tls.Config{ServerName: speedTestDomain})
+		if err := tlsConn.Handshake(); err != nil {
+			_ = conn.Close()
+			return 0, ""
+		}
+		rwc = tlsConn
+	}
+	requestTarget := "/cdn-cgi/trace"
+	if !useTLS {
+		requestTarget = "http://" + speedTestDomain + requestTarget
+	}
+	reqStr := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n", requestTarget, speedTestDomain)
+	if _, err = rwc.Write([]byte(reqStr)); err != nil {
+		_ = rwc.Close()
+		return 0, ""
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(rwc), nil)
+	_ = rwc.Close()
+	if err != nil {
+		return 0, ""
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return 0, ""
+	}
+	colo := extractDataCenter(resp.Header.Get("CF-RAY"))
+	if colo == "" {
+		return 0, ""
+	}
+	sampleMs := int(tcpDuration.Milliseconds())
+	if sampleMs < 1 {
+		sampleMs = 1
+	}
+	return sampleMs, colo
 }
 
 // runSpeedTestSimple 简单速度测试，返回 (峰值速度 kB/s, 单次 TCP 建连耗时 ms, 数据中心代码)。
@@ -767,39 +803,24 @@ func (f locationFilter) Summary() string {
 	return strings.Join(parts, " / ")
 }
 
-func loadGeoPrefixes(ipType int, filter locationFilter) ([]netip.Prefix, error) {
-	path := geoDatabasePath()
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		fmt.Println("本地地区 IP 网段数据库不存在，正在从 Cloudflare 更新...")
-		content, err := getURLContent("https://api.cloudflare.com/local-ip-ranges.csv")
-		if err != nil {
-			return nil, err
-		}
-		if err := saveToFile(path, content); err != nil {
-			return nil, err
-		}
+func (f locationFilter) MatchesDataCenter(code string) bool {
+	if !f.Enabled() {
+		return true
 	}
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, err
+	loc := lookupLocation(code)
+	if loc.Iata == "" {
+		return false
 	}
-	defer file.Close()
-	entries, err := geodb.Parse(file)
-	if err != nil {
-		return nil, err
+	if f.Country != "" && !strings.EqualFold(f.Country, loc.Cca2) {
+		return false
 	}
-	return geodb.Prefixes(entries, ipType, geodb.Filter{
-		Country: filter.Country,
-		Region:  filter.Region,
-		City:    filter.City,
-	}), nil
-}
-
-func geoDatabasePath() string {
-	if path := strings.TrimSpace(os.Getenv("BETTER_CF_GEO_DB_PATH")); path != "" {
-		return path
+	if f.Region != "" && !strings.EqualFold(f.Region, loc.Region) {
+		return false
 	}
-	return dataPath("local-ip-ranges.csv")
+	if f.City != "" && !strings.EqualFold(f.City, loc.City) {
+		return false
+	}
+	return true
 }
 
 func dataPath(name string) string {

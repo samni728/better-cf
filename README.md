@@ -39,9 +39,9 @@ Better CF 是一个基于 `better-cloudflare-ip` 的 Cloudflare 优选 IP 自动
 - 是否启用 IPv4 扫描与 A 记录同步
 - 是否启用 IPv6 扫描与 AAAA 记录同步
 - 全局随机、地区优先或严格地区筛选
-- 按 Cloudflare IP 网段数据库选择国家、区域/省级代码和城市
-- 国家、区域、城市三级联动，例如 `CN → CN-GD → Guangzhou`
-- 实时显示当前地区匹配的 IPv4 / IPv6 网段数量，并明确提示配置是否已经保存
+- 按 `CF-RAY` 实测响应机房选择国家、Cloudflare 大区和城市
+- 国家、大区、城市三级联动，例如 `JP → Asia Pacific → Tokyo`
+- 实时显示当前地区匹配的 Cloudflare 机房数量与 IATA 代码
 - IPv4 写入数量
 - IPv6 写入数量
 - 期望带宽 Mbps
@@ -51,15 +51,15 @@ Better CF 是一个基于 `better-cloudflare-ip` 的 Cloudflare 优选 IP 自动
 
 如果某个协议族没有勾选启用，或者写入数量为 0，系统会跳过该协议族的扫描和 DNS 同步。例如 VPS 没有 IPv6 时，可以取消 IPv6 勾选，或把 IPv6 数量设为 0。
 
-当前执行逻辑会按任务串行收集结果，避免多个测速任务并发影响真实带宽表现。每个候选 IP 在下载测速前后各执行 3 次 TCP RTT 采样；任意一次超过最大 RTT 都会被淘汰，最终页面显示两轮中较差的平均 RTT。
+当前执行逻辑会按任务串行收集结果，避免多个测速任务并发影响真实带宽表现。候选 IP 先进行一次快速 HTTPS 响应和 `CF-RAY` 机房检测；通过后在下载测速前后各执行 3 次 TCP RTT 采样。任意一次超过最大 RTT 都会被淘汰，最终页面显示两轮中较差的平均 RTT。
 
 地区模式的含义：
 
 - 全局随机：下方保留的地区值不参与筛选，从全球 IP 池随机抽取。
-- 所选地区优先：每次选优先在所选网段内重试，连续 10 分钟没有达标结果才回退全球。
-- 仅测试所选地区：始终只从所选网段生成候选 IP，不回退全球；单个协议族连续 30 分钟没有新增结果时任务失败。
+- 所选地区优先：候选仍来自原版全局 Anycast 地址池，先只接受 `CF-RAY` 实测机房匹配的结果，连续 10 分钟无结果才回退全球。
+- 仅接受所选地区：只接受 `CF-RAY` 实测机房匹配的结果，不回退全球；单个协议族连续 30 分钟没有新增结果时任务失败。
 
-地区数据来自 Cloudflare GeoFeed，表示候选 IP 网段的地理标签。Cloudflare 使用 Anycast，实际响应机房仍以测速响应中的 `CF-RAY` 为准，不保证与网段标签相同。
+可选机房来自 `locations.json`。Cloudflare 使用 Anycast，IP 本身没有固定落地国家；所以地区条件以当前 VPS 对测速域名发起请求时返回的 `CF-RAY` 为准。Cloudflare GeoFeed 快照仍保留作为地理数据参考，但不再用来生成测速候选 IP。
 
 ### 2. Cloudflare DNS 自动同步
 
@@ -178,7 +178,7 @@ data/app_state.json
 database/local-ip-ranges.csv
 ```
 
-文件每行字段为 `CIDR, 国家, 区域/数据中心代码, 城市` 。首次启动会复制到 `data/local-ip-ranges.csv`；之后可在 WebUI 的“地区筛选”中点击“更新地区 IP 数据库”，从 Cloudflare GeoFeed 重新下载、校验并原子替换运行时数据。
+文件每行字段为 `CIDR, 国家, 区域代码, 城市`。首次启动会复制到 `data/local-ip-ranges.csv`；之后可在 WebUI 中更新。注意：这份 GeoFeed 快照是地理数据参考，不是 better-cloudflare-ip 的可测 CDN 地址池；实际扫描候选来自 `ips-v4.txt / ips-v6.txt`，地区判定来自 `CF-RAY + locations.json`。
 
 该目录包含管理员账号哈希、Cloudflare Token、任务历史和测速结果，不应该提交到 Git。
 

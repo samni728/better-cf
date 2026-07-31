@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-func TestLocationFilterSummaryUsesGeoFeedFields(t *testing.T) {
+func TestLocationFilterSummaryUsesMeasuredLocationFields(t *testing.T) {
 	filter := locationFilter{Mode: "strict", Country: "CN", Region: "CN-GD", City: "Guangzhou"}
 	want := "严格地区 / 国家=CN / 区域=CN-GD / 城市=Guangzhou"
 	if got := filter.Summary(); got != want {
@@ -64,18 +64,25 @@ func TestMaxRTTFromEnv(t *testing.T) {
 	}
 }
 
-func TestGeoDatabasePathPrefersExplicitSharedDatabase(t *testing.T) {
-	old, existed := os.LookupEnv("BETTER_CF_GEO_DB_PATH")
+func TestLocationFilterMatchesMeasuredDataCenter(t *testing.T) {
+	locationMu.Lock()
+	previous := locationMap
+	locationMap = map[string]location{
+		"NRT": {Iata: "NRT", Cca2: "JP", Region: "Asia Pacific", City: "Tokyo"},
+		"LAX": {Iata: "LAX", Cca2: "US", Region: "North America", City: "Los Angeles"},
+	}
+	locationMu.Unlock()
 	t.Cleanup(func() {
-		if existed {
-			_ = os.Setenv("BETTER_CF_GEO_DB_PATH", old)
-		} else {
-			_ = os.Unsetenv("BETTER_CF_GEO_DB_PATH")
-		}
+		locationMu.Lock()
+		locationMap = previous
+		locationMu.Unlock()
 	})
 
-	_ = os.Setenv("BETTER_CF_GEO_DB_PATH", "/tmp/shared-geo.csv")
-	if got := geoDatabasePath(); got != "/tmp/shared-geo.csv" {
-		t.Fatalf("geoDatabasePath() = %q, want shared path", got)
+	filter := locationFilter{Mode: "strict", Country: "JP", City: "Tokyo"}
+	if !filter.MatchesDataCenter("NRT") {
+		t.Fatal("expected NRT CF-RAY data center to match JP/Tokyo")
+	}
+	if filter.MatchesDataCenter("LAX") {
+		t.Fatal("expected LAX CF-RAY data center not to match JP/Tokyo")
 	}
 }

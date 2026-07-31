@@ -2,11 +2,8 @@ package main
 
 import (
 	"html/template"
-	"path/filepath"
 	"strings"
 	"testing"
-
-	"cf-betterip-ser/internal/geodb"
 )
 
 func TestParseBetterIPOutputIncludesLocation(t *testing.T) {
@@ -32,13 +29,13 @@ func TestParseBetterIPOutputIncludesLocation(t *testing.T) {
 }
 
 func TestBuildGeoChoicesCascadesByCountry(t *testing.T) {
-	locations := []geodb.Location{
-		{Country: "JP", Region: "JP-13", City: "Tokyo"},
-		{Country: "JP", Region: "JP-27", City: "Osaka"},
-		{Country: "CN", Region: "CN-GD", City: "Guangzhou"},
+	locations := []GeoLocation{
+		{IATA: "NRT", Country: "JP", Region: "Asia Pacific", City: "Tokyo"},
+		{IATA: "KIX", Country: "JP", Region: "Asia Pacific", City: "Osaka"},
+		{IATA: "LAX", Country: "US", Region: "North America", City: "Los Angeles"},
 	}
 	_, regions, cities := buildGeoChoices(locations, Settings{LocationCountry: "JP"})
-	if len(regions) != 2 || regions[0].Value != "JP-13" || regions[1].Value != "JP-27" {
+	if len(regions) != 1 || regions[0].Value != "Asia Pacific" {
 		t.Fatalf("unexpected regions: %+v", regions)
 	}
 	if len(cities) != 2 || cities[0].Value != "Osaka" || cities[1].Value != "Tokyo" {
@@ -47,17 +44,15 @@ func TestBuildGeoChoicesCascadesByCountry(t *testing.T) {
 }
 
 func TestCalculateGeoFilterStats(t *testing.T) {
-	locations := []geodb.Location{
-		{Country: "CN", Region: "CN-GD", City: "Guangzhou", IPv4Count: 40, IPv6Count: 10},
-		{Country: "CN", Region: "CN-GD", City: "Shenzhen", IPv4Count: 12, IPv6Count: 4},
-		{Country: "JP", Region: "JP-13", City: "Tokyo", IPv4Count: 8, IPv6Count: 2},
+	locations := []GeoLocation{
+		{IATA: "NRT", Country: "JP", Region: "Asia Pacific", City: "Tokyo"},
+		{IATA: "KIX", Country: "JP", Region: "Asia Pacific", City: "Osaka"},
+		{IATA: "LAX", Country: "US", Region: "North America", City: "Los Angeles"},
 	}
 	stats := calculateGeoFilterStats(locations, Settings{
-		LocationCountry: "CN",
-		LocationRegion:  "CN-GD",
-		LocationCity:    "Guangzhou",
+		LocationCountry: "JP",
 	})
-	if stats.IPv4Count != 40 || stats.IPv6Count != 10 || stats.Total != 50 {
+	if stats.DataCenterCount != 2 || stats.Codes != "KIX / NRT" {
 		t.Fatalf("unexpected stats: %+v", stats)
 	}
 }
@@ -73,9 +68,9 @@ func TestLocationSummaryExplainsIgnoredAndStrictSelections(t *testing.T) {
 		t.Fatalf("global summary is ambiguous: %q", got)
 	}
 	settings.LocationMode = "strict"
-	stats := GeoFilterStats{IPv4Count: 40, IPv6Count: 10, Total: 50}
+	stats := GeoFilterStats{DataCenterCount: 2, Codes: "KIX / NRT"}
 	got := locationFilterSummaryWithStats(settings, stats)
-	if !strings.Contains(got, "IPv4 40 段") || !strings.Contains(got, "IPv6 10 段") || !strings.Contains(got, "不回退全局") {
+	if !strings.Contains(got, "目标机房 2 个") || !strings.Contains(got, "KIX / NRT") || !strings.Contains(got, "CF-RAY") || !strings.Contains(got, "不回退全局") {
 		t.Fatalf("strict summary is incomplete: %q", got)
 	}
 }
@@ -83,23 +78,12 @@ func TestLocationSummaryExplainsIgnoredAndStrictSelections(t *testing.T) {
 func TestRunSummaryFreezesStrictLocationAndCounts(t *testing.T) {
 	settings := defaultSettings()
 	settings.LocationMode = "strict"
-	settings.LocationCountry = "CN"
-	settings.LocationRegion = "CN-GD"
-	settings.LocationCity = "Guangzhou"
-	summary := runSummary("manual", settings, GeoFilterStats{IPv4Count: 40, IPv6Count: 10, Total: 50})
-	for _, required := range []string{"立即执行", "严格地区", "CN-GD", "Guangzhou", "IPv4 40 段", "IPv6 10 段", "不回退全局"} {
+	settings.LocationCountry = "JP"
+	summary := runSummary("manual", settings, GeoFilterStats{DataCenterCount: 2, Codes: "KIX / NRT"})
+	for _, required := range []string{"立即执行", "严格地区", "JP", "目标机房 2 个", "KIX / NRT", "CF-RAY", "不回退全局"} {
 		if !strings.Contains(summary, required) {
 			t.Fatalf("run summary %q does not contain %q", summary, required)
 		}
-	}
-}
-
-func TestAppGeoDatabasePathIsAbsoluteAndShared(t *testing.T) {
-	app := &App{dataDir: t.TempDir()}
-	got := app.geoDatabasePath()
-	want := filepath.Join(app.dataDir, "local-ip-ranges.csv")
-	if got != want || !filepath.IsAbs(got) {
-		t.Fatalf("geoDatabasePath() = %q, want absolute %q", got, want)
 	}
 }
 
