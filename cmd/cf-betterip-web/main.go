@@ -15,6 +15,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/exec"
@@ -1381,7 +1382,7 @@ func (a *App) startRun(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	go a.executeRun(run.ID, state.Settings)
+	go a.executeRun(run.ID, state.Settings, "manual")
 	http.Redirect(w, r, "/run", http.StatusFound)
 }
 
@@ -1406,7 +1407,7 @@ func (a *App) resumeRun(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	go a.executeRunWithSeed(run.ID, state.Settings, source.ID, seed)
+	go a.executeRunWithSeed(run.ID, state.Settings, "resume", source.ID, seed)
 	http.Redirect(w, r, "/run", http.StatusFound)
 }
 
@@ -1450,11 +1451,11 @@ func (a *App) runsAPI(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(recentRuns(state.Runs, 20))
 }
 
-func (a *App) executeRun(id string, settings Settings) {
-	a.executeRunWithSeed(id, settings, "", nil)
+func (a *App) executeRun(id string, settings Settings, trigger string) {
+	a.executeRunWithSeed(id, settings, trigger, "", nil)
 }
 
-func (a *App) executeRunWithSeed(id string, settings Settings, sourceRunID string, seed []IPTestResult) {
+func (a *App) executeRunWithSeed(id string, settings Settings, trigger, sourceRunID string, seed []IPTestResult) {
 	ctx, cancel := context.WithTimeout(context.Background(), runTimeout())
 	a.tasks.register(id, cancel)
 	defer func() {
@@ -1464,10 +1465,6 @@ func (a *App) executeRunWithSeed(id string, settings Settings, sourceRunID strin
 
 	required := requiredIPCount(settings)
 	a.store.updateRunProgress(id, "读取配置", 5, 0, 0, "pending")
-	trigger := "manual"
-	if sourceRunID != "" {
-		trigger = "resume"
-	}
 	geoStats := a.geoFilterStats(settings)
 	a.store.appendRunLog(id, "info", "开始真实执行："+runSummary(trigger, settings, geoStats))
 	a.store.appendRunLog(id, "info", "本次地区策略："+locationFilterSummaryWithStats(settings, geoStats))
@@ -1498,6 +1495,7 @@ func (a *App) executeRunWithSeed(id string, settings Settings, sourceRunID strin
 	existingV6 := countFamily(results, 6)
 	ipv4TargetCount := activeIPv4Count(settings)
 	ipv6TargetCount := activeIPv6Count(settings)
+	var familyFailures []string
 	if ipv4TargetCount > 0 {
 		remaining := ipv4TargetCount - existingV4
 		if remaining > 0 {
@@ -1505,8 +1503,16 @@ func (a *App) executeRunWithSeed(id string, settings Settings, sourceRunID strin
 			v4, err := a.collectFamilyResults(ctx, id, settings, 4, remaining, seen, len(results), required)
 			results = append(results, v4...)
 			if err != nil {
-				a.finishRunFromError(id, err)
-				return
+				if shouldAbortWholeRun(ctx, err) {
+					a.finishRunFromError(id, err)
+					return
+				}
+				familyFailures = append(familyFailures, err.Error())
+				nextAction := "该任务未启用 IPv6，将统一判定最终状态"
+				if ipv6TargetCount > 0 {
+					nextAction = "继续执行 IPv6"
+				}
+				a.store.appendRunLog(id, "warn", fmt.Sprintf("IPv4 未收集满 %d 个，已保留当前 %d 个结果；不提前结束整个任务，%s。原因：%s", ipv4TargetCount, existingV4+len(v4), nextAction, err))
 			}
 		} else {
 			a.store.appendRunLog(id, "info", fmt.Sprintf("IPv4 已满足：%d/%d。", existingV4, ipv4TargetCount))
@@ -1521,8 +1527,12 @@ func (a *App) executeRunWithSeed(id string, settings Settings, sourceRunID strin
 			v6, err := a.collectFamilyResults(ctx, id, settings, 6, remaining, seen, len(results), required)
 			results = append(results, v6...)
 			if err != nil {
-				a.finishRunFromError(id, err)
-				return
+				if shouldAbortWholeRun(ctx, err) {
+					a.finishRunFromError(id, err)
+					return
+				}
+				familyFailures = append(familyFailures, err.Error())
+				a.store.appendRunLog(id, "warn", fmt.Sprintf("IPv6 未收集满 %d 个，已保留当前 %d 个结果。原因：%s", ipv6TargetCount, existingV6+len(v6), err))
 			}
 		} else {
 			a.store.appendRunLog(id, "info", fmt.Sprintf("IPv6 已满足：%d/%d。", existingV6, ipv6TargetCount))
@@ -1532,7 +1542,12 @@ func (a *App) executeRunWithSeed(id string, settings Settings, sourceRunID strin
 	}
 
 	if len(results) != required {
-		a.store.finishRun(id, "failed", fmt.Sprintf("扫描结果数量不足：需要 %d 个，实际 %d 个；未执行 DNS 更新。", required, len(results)))
+		summary := fmt.Sprintf("所有已启用协议族已全部执行；IPv4 %d/%d，IPv6 %d/%d，共 %d/%d。数量不足，未执行 DNS 更新。",
+			countFamily(results, 4), ipv4TargetCount, countFamily(results, 6), ipv6TargetCount, len(results), required)
+		if len(familyFailures) > 0 {
+			summary += " 失败原因：" + strings.Join(familyFailures, " | ")
+		}
+		a.store.finishRun(id, "failed", summary)
 		return
 	}
 
@@ -1567,6 +1582,10 @@ func (a *App) finishRunFromError(id string, err error) {
 	a.store.finishRun(id, "failed", err.Error())
 }
 
+func shouldAbortWholeRun(ctx context.Context, err error) bool {
+	return ctx.Err() != nil || errors.Is(err, context.Canceled)
+}
+
 func (a *App) schedulerLoop() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
@@ -1581,7 +1600,7 @@ func (a *App) schedulerLoop() {
 			log.Printf("scheduled run create failed: %v", err)
 			continue
 		}
-		go a.executeRun(run.ID, state.Settings)
+		go a.executeRun(run.ID, state.Settings, "scheduled")
 	}
 }
 
@@ -1597,10 +1616,15 @@ func (a *App) collectFamilyResults(ctx context.Context, id string, settings Sett
 		progress := 10 + ((existingCount + len(results)) * 65 / requiredCount)
 		a.store.updateRunProgress(id, stage, progress, existingCount+len(results), 0, "pending")
 		a.store.appendRunLog(id, "info", fmt.Sprintf("IPv%d 第 %d 次尝试，目标收集 %d/%d。", ipVersion, attempt, len(results), targetCount))
+		hintSubnets := a.regionalHintSubnets(settings, ipVersion)
+		historyIPs := a.regionalHistoryIPs(settings, ipVersion, seen)
+		if attempt == 1 && len(hintSubnets) > 0 {
+			a.store.appendRunLog(id, "info", fmt.Sprintf("历史经验已加载：%d 个可重测 IPv%d，%d 个地区优先子网。先复测具体 IP，再从成功子网生成新 IP，同时继续遍历原版全局地址池。", len(historyIPs), ipVersion, len(hintSubnets)))
+		}
 
 		resultDeadline := lastResultAt.Add(noResultTimeout)
 		attemptCtx, cancel := context.WithDeadline(ctx, resultDeadline)
-		result, output, err := runBetterIPScan(attemptCtx, settings, ipVersion, func(message string) {
+		result, output, err := runBetterIPScan(attemptCtx, settings, ipVersion, historyIPs, hintSubnets, func(message string) {
 			a.store.appendRunLog(id, "info", message)
 		})
 		cancel()
@@ -1619,7 +1643,7 @@ func (a *App) collectFamilyResults(ctx context.Context, id string, settings Sett
 				if normalizeLocationMode(settings.LocationMode) != "any" {
 					detail = "本任务按 CF-RAY 筛选实际响应机房；当前 VPS 路由可能无法到达所选机房，也可能是 RTT 或带宽未达标"
 				}
-				return results, fmt.Errorf("IPv%d 连续 %s 没有新增有效 IP，已自动停止该任务；%s", ipVersion, formatDuration(noResultTimeout), detail)
+				return results, fmt.Errorf("IPv%d 连续 %s 没有新增有效 IP，已停止该协议族并让整体任务继续；%s", ipVersion, formatDuration(noResultTimeout), detail)
 			}
 			a.store.appendRunLog(id, "error", fmt.Sprintf("IPv%d 第 %d 次尝试失败：%v", ipVersion, attempt, err))
 			continue
@@ -1658,7 +1682,80 @@ func (a *App) collectFamilyResults(ctx context.Context, id string, settings Sett
 	return results, nil
 }
 
-func runBetterIPScan(ctx context.Context, settings Settings, ipVersion int, onLog func(string)) (IPTestResult, string, error) {
+func (a *App) regionalHintSubnets(settings Settings, ipVersion int) []string {
+	if normalizeLocationMode(settings.LocationMode) == "any" || locationSelectionText(settings) == "" {
+		return nil
+	}
+	state := a.store.snapshot()
+	seen := make(map[string]bool)
+	result := make([]string, 0, 20)
+	for _, item := range state.Results {
+		if item.IPVersion != ipVersion || !resultMatchesLocation(item, settings) {
+			continue
+		}
+		addr, err := netip.ParseAddr(item.IP)
+		if err != nil || (ipVersion == 4) != addr.Is4() {
+			continue
+		}
+		bits := 48
+		if ipVersion == 4 {
+			bits = 24
+		}
+		subnet := netip.PrefixFrom(addr, bits).Masked().String()
+		if seen[subnet] {
+			continue
+		}
+		seen[subnet] = true
+		result = append(result, subnet)
+		if len(result) >= 20 {
+			break
+		}
+	}
+	return result
+}
+
+func (a *App) regionalHistoryIPs(settings Settings, ipVersion int, excluded map[string]bool) []string {
+	if normalizeLocationMode(settings.LocationMode) == "any" || locationSelectionText(settings) == "" {
+		return nil
+	}
+	state := a.store.snapshot()
+	seen := make(map[string]bool)
+	result := make([]string, 0, 50)
+	for _, item := range state.Results {
+		if item.IPVersion != ipVersion || excluded[item.IP] || !resultMatchesLocation(item, settings) {
+			continue
+		}
+		addr, err := netip.ParseAddr(item.IP)
+		if err != nil || (ipVersion == 4) != addr.Is4() {
+			continue
+		}
+		value := addr.String()
+		if seen[value] {
+			continue
+		}
+		seen[value] = true
+		result = append(result, value)
+		if len(result) >= 50 {
+			break
+		}
+	}
+	return result
+}
+
+func resultMatchesLocation(item IPTestResult, settings Settings) bool {
+	if settings.LocationCountry != "" && !strings.EqualFold(settings.LocationCountry, item.DataCenterCountry) {
+		return false
+	}
+	if settings.LocationRegion != "" && !strings.EqualFold(settings.LocationRegion, item.DataCenterRegion) {
+		return false
+	}
+	if settings.LocationCity != "" && !strings.EqualFold(settings.LocationCity, item.DataCenterCity) {
+		return false
+	}
+	return true
+}
+
+func runBetterIPScan(ctx context.Context, settings Settings, ipVersion int, historyIPs, hintSubnets []string, onLog func(string)) (IPTestResult, string, error) {
 	bin, err := findScannerBinary()
 	if err != nil {
 		return IPTestResult{}, "", err
@@ -1683,6 +1780,8 @@ func runBetterIPScan(ctx context.Context, settings Settings, ipVersion int, onLo
 		"BETTER_CF_LOCATION_COUNTRY="+strings.TrimSpace(settings.LocationCountry),
 		"BETTER_CF_LOCATION_REGION="+strings.TrimSpace(settings.LocationRegion),
 		"BETTER_CF_LOCATION_CITY="+strings.TrimSpace(settings.LocationCity),
+		"BETTER_CF_HINT_IPS="+strings.Join(historyIPs, ","),
+		"BETTER_CF_HINT_SUBNETS="+strings.Join(hintSubnets, ","),
 	)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -3238,7 +3337,7 @@ const settingsTemplate = `
     </div>
 
     <h2 style="margin-top:22px">地区筛选</h2>
-    <p class="muted">候选 IPv4 / IPv6 始终从原版 better-cloudflare-ip 的 Cloudflare Anycast 地址池生成。程序先快速请求测速域名，再根据响应头 <code>CF-RAY</code> 的实测机房按国家、区域和城市筛选；不再把 GeoFeed 地理标签网段误当成可测 CDN 地址池。</p>
+    <p class="muted">候选 IPv4 / IPv6 始终来自原版 better-cloudflare-ip 的 Cloudflare Anycast 地址池。地区扫描会先复测同地区历史成功 IP，再从其 IPv4 <code>/24</code> 或 IPv6 <code>/48</code> 子网扩展新 IP，同时无重复遍历原版全局池。结果仍按响应头 <code>CF-RAY</code> 的实测机房筛选，不把 GeoFeed 地理标签网段误当成可测 CDN 地址池。</p>
     <div class="row" style="margin-bottom:12px">
       {{if .GeoDatabase.Ready}}
         <span class="muted">数据库已就绪：{{.GeoDatabase.LocationCount}} 个 Cloudflare 响应机房，更新于 {{.GeoDatabase.UpdatedAt}}</span>

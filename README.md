@@ -61,6 +61,8 @@ Better CF 是一个基于 `better-cloudflare-ip` 的 Cloudflare 优选 IP 自动
 
 可选机房来自 `locations.json`。Cloudflare 使用 Anycast，IP 本身没有固定落地国家；所以地区条件以当前 VPS 对测速域名发起请求时返回的 `CF-RAY` 为准。Cloudflare GeoFeed 快照仍保留作为地理数据参考，但不再用来生成测速候选 IP。
 
+地区扫描先按当前条件重测历史成功 IP，仍达标则直接复用；否则优先从历史及当前命中的 IPv4 `/24` 或 IPv6 `/48` 子网扩展新 IP，并在全局地址池遍历完前不重复抽取子网。IPv4 或 IPv6 某一方连续 30 分钟无新增结果时，只结束该协议族并继续另一方；数量未全部满足时不执行部分 DNS 替换。
+
 ### 2. Cloudflare DNS 自动同步
 
 扫描达到目标数量后，系统会一次性同步到 Cloudflare：

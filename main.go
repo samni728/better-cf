@@ -10,6 +10,7 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"sort"
@@ -182,6 +183,15 @@ func cloudflareTest(ipType int, useTLS bool, taskNum int, speed int, maxRTTMs in
 	if filter.Enabled() {
 		fmt.Printf("候选 IP 仍从原版地址池生成；实际响应机房将根据 CF-RAY 按 %s 筛选。\n", filter.Summary())
 	}
+	hintSubnets := hintSubnetsFromEnv(ipType)
+	if len(hintSubnets) > 0 {
+		fmt.Printf("已从历史成功结果提取 %d 个 IPv%d 优先子网，每轮会先从这些子网生成新 IP。\n", len(hintSubnets), ipType)
+	}
+	historyIPs := hintIPsFromEnv(ipType)
+	if len(historyIPs) > 0 {
+		fmt.Printf("已加载 %d 个同地区历史成功 IPv%d，先按当前 RTT、带宽和 CF-RAY 条件重测。\n", len(historyIPs), ipType)
+	}
+	subnetSampler := newSubnetSampler(ipList)
 
 	sampleSize := 100
 	if len(ipList) < sampleSize {
@@ -190,6 +200,7 @@ func cloudflareTest(ipType int, useTLS bool, taskNum int, speed int, maxRTTMs in
 
 	filterStartedAt := time.Now()
 	fallbackLogged := false
+	historyPending := len(historyIPs) > 0
 	for {
 		activeFilter := filter.Active(time.Since(filterStartedAt))
 		if filter.Enabled() && !activeFilter.Enabled() && !fallbackLogged {
@@ -198,15 +209,20 @@ func cloudflareTest(ipType int, useTLS bool, taskNum int, speed int, maxRTTMs in
 		}
 		var rttResults []RTTResult
 		for {
-			sampled := randomSample(ipList, sampleSize)
 			var testIPs []string
-			if ipType == 6 {
-				testIPs = getRandomIPv6s(sampled)
+			if historyPending {
+				historyPending = false
+				testIPs = append([]string(nil), historyIPs...)
+				fmt.Printf("正在优先复测 %d 个历史成功 IP...\n", len(testIPs))
 			} else {
-				testIPs = getRandomIPv4s(sampled)
+				sampled := candidateSubnets(subnetSampler, hintSubnets, sampleSize)
+				if ipType == 6 {
+					testIPs = getRandomIPv6s(sampled)
+				} else {
+					testIPs = getRandomIPv4s(sampled)
+				}
+				fmt.Printf("已从原版地址池生成 %d 个候选 IP，先进行快速响应和机房检测...\n", len(testIPs))
 			}
-
-			fmt.Printf("已从原版地址池生成 %d 个候选 IP，先进行快速响应和机房检测...\n", len(testIPs))
 
 			rttResults = runRTTTest(testIPs, taskNum, useTLS, maxRTTMs, activeFilter)
 			if len(rttResults) > 0 {
@@ -218,6 +234,13 @@ func cloudflareTest(ipType int, useTLS bool, taskNum int, speed int, maxRTTMs in
 				fmt.Println("本轮没有 RTT 达标的 Cloudflare 响应 IP，继续换一批候选...")
 			}
 			activeFilter = filter.Active(time.Since(filterStartedAt))
+		}
+		if activeFilter.Enabled() {
+			before := len(hintSubnets)
+			hintSubnets = extendHintSubnets(hintSubnets, rttResults, ipType)
+			if added := len(hintSubnets) - before; added > 0 {
+				fmt.Printf("本轮新发现 %d 个实测匹配子网；即使当前 IP 带宽未达标，下一轮也会优先从这些子网扩展新 IP。\n", added)
+			}
 		}
 
 		fmt.Println("待测速的 IP 地址")
@@ -281,6 +304,165 @@ func cloudflareTest(ipType int, useTLS bool, taskNum int, speed int, maxRTTMs in
 		}
 		fmt.Println("当前所有 IP 都未达到期望带宽，重新开始新一轮测试...")
 	}
+}
+
+type subnetSampler struct {
+	list   []string
+	cursor int
+}
+
+func newSubnetSampler(list []string) *subnetSampler {
+	s := &subnetSampler{list: append([]string(nil), list...)}
+	s.reshuffle()
+	return s
+}
+
+func (s *subnetSampler) reshuffle() {
+	randomMu.Lock()
+	randomGenerator.Shuffle(len(s.list), func(i, j int) {
+		s.list[i], s.list[j] = s.list[j], s.list[i]
+	})
+	randomMu.Unlock()
+	s.cursor = 0
+}
+
+// Next 在遍历完整个地址池前不重复抽取子网，避免地区候选稀少时反复命中同一批网段。
+func (s *subnetSampler) Next(n int) []string {
+	if n <= 0 || len(s.list) == 0 {
+		return nil
+	}
+	result := make([]string, 0, n)
+	for len(result) < n {
+		if s.cursor >= len(s.list) {
+			s.reshuffle()
+		}
+		remaining := n - len(result)
+		available := len(s.list) - s.cursor
+		if remaining > available {
+			remaining = available
+		}
+		result = append(result, s.list[s.cursor:s.cursor+remaining]...)
+		s.cursor += remaining
+		if n >= len(s.list) {
+			break
+		}
+	}
+	return result
+}
+
+func candidateSubnets(sampler *subnetSampler, hints []string, sampleSize int) []string {
+	if sampleSize <= 0 {
+		return nil
+	}
+	hintLimit := len(hints)
+	if hintLimit > 20 {
+		hintLimit = 20
+	}
+	if hintLimit > sampleSize/2 {
+		hintLimit = sampleSize / 2
+	}
+	result := make([]string, 0, sampleSize)
+	seen := make(map[string]bool, sampleSize)
+	if hintLimit > 0 {
+		for _, subnet := range randomSample(hints, hintLimit) {
+			if !seen[subnet] {
+				seen[subnet] = true
+				result = append(result, subnet)
+			}
+		}
+	}
+	for len(result) < sampleSize {
+		batch := sampler.Next(sampleSize - len(result))
+		if len(batch) == 0 {
+			break
+		}
+		for _, subnet := range batch {
+			if seen[subnet] {
+				continue
+			}
+			seen[subnet] = true
+			result = append(result, subnet)
+		}
+	}
+	return result
+}
+
+func hintSubnetsFromEnv(ipType int) []string {
+	raw := strings.TrimSpace(os.Getenv("BETTER_CF_HINT_SUBNETS"))
+	if raw == "" {
+		return nil
+	}
+	parts := strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ',' || r == ';' || r == '\n' || r == '\r' || r == ' ' || r == '\t'
+	})
+	seen := make(map[string]bool)
+	result := make([]string, 0, len(parts))
+	for _, item := range parts {
+		prefix, err := netip.ParsePrefix(strings.TrimSpace(item))
+		if err != nil || (ipType == 4) != prefix.Addr().Is4() {
+			continue
+		}
+		value := prefix.Masked().String()
+		if seen[value] {
+			continue
+		}
+		seen[value] = true
+		result = append(result, value)
+	}
+	return result
+}
+
+func hintIPsFromEnv(ipType int) []string {
+	raw := strings.TrimSpace(os.Getenv("BETTER_CF_HINT_IPS"))
+	if raw == "" {
+		return nil
+	}
+	parts := strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ',' || r == ';' || r == '\n' || r == '\r' || r == ' ' || r == '\t'
+	})
+	seen := make(map[string]bool)
+	result := make([]string, 0, len(parts))
+	for _, item := range parts {
+		addr, err := netip.ParseAddr(strings.TrimSpace(item))
+		if err != nil || (ipType == 4) != addr.Is4() {
+			continue
+		}
+		value := addr.String()
+		if seen[value] {
+			continue
+		}
+		seen[value] = true
+		result = append(result, value)
+		if len(result) >= 100 {
+			break
+		}
+	}
+	return result
+}
+
+func extendHintSubnets(existing []string, results []RTTResult, ipType int) []string {
+	seen := make(map[string]bool, len(existing)+len(results))
+	extended := append([]string(nil), existing...)
+	for _, subnet := range extended {
+		seen[subnet] = true
+	}
+	bits := 48
+	if ipType == 4 {
+		bits = 24
+	}
+	for _, result := range results {
+		addr, err := netip.ParseAddr(result.IP)
+		if err != nil || (ipType == 4) != addr.Is4() {
+			continue
+		}
+		subnet := netip.PrefixFrom(addr, bits).Masked().String()
+		if seen[subnet] {
+			continue
+		}
+		seen[subnet] = true
+		extended = append(extended, subnet)
+	}
+	return extended
 }
 
 // randomSample 从列表中随机抽取 n 个元素

@@ -86,3 +86,62 @@ func TestLocationFilterMatchesMeasuredDataCenter(t *testing.T) {
 		t.Fatal("expected LAX CF-RAY data center not to match JP/Tokyo")
 	}
 }
+
+func TestSubnetSamplerDoesNotRepeatBeforePoolIsExhausted(t *testing.T) {
+	sampler := newSubnetSampler([]string{"a", "b", "c", "d"})
+	first := sampler.Next(2)
+	second := sampler.Next(2)
+	seen := make(map[string]bool)
+	for _, value := range append(first, second...) {
+		if seen[value] {
+			t.Fatalf("subnet %q repeated before the pool was exhausted", value)
+		}
+		seen[value] = true
+	}
+	if len(seen) != 4 {
+		t.Fatalf("visited %d unique subnets, want 4", len(seen))
+	}
+}
+
+func TestHintSubnetsFromEnvFiltersFamilyAndDuplicates(t *testing.T) {
+	old, existed := os.LookupEnv("BETTER_CF_HINT_SUBNETS")
+	t.Cleanup(func() {
+		if existed {
+			_ = os.Setenv("BETTER_CF_HINT_SUBNETS", old)
+		} else {
+			_ = os.Unsetenv("BETTER_CF_HINT_SUBNETS")
+		}
+	})
+	_ = os.Setenv("BETTER_CF_HINT_SUBNETS", "162.159.39.0/24,162.159.39.76/24,2606:4700:52::/48,invalid")
+	got := hintSubnetsFromEnv(4)
+	if len(got) != 1 || got[0] != "162.159.39.0/24" {
+		t.Fatalf("hintSubnetsFromEnv(4) = %v", got)
+	}
+}
+
+func TestHintIPsFromEnvFiltersFamilyAndDuplicates(t *testing.T) {
+	old, existed := os.LookupEnv("BETTER_CF_HINT_IPS")
+	t.Cleanup(func() {
+		if existed {
+			_ = os.Setenv("BETTER_CF_HINT_IPS", old)
+		} else {
+			_ = os.Unsetenv("BETTER_CF_HINT_IPS")
+		}
+	})
+	_ = os.Setenv("BETTER_CF_HINT_IPS", "162.159.39.76,162.159.39.76,2606:4700:52::1,invalid")
+	got := hintIPsFromEnv(4)
+	if len(got) != 1 || got[0] != "162.159.39.76" {
+		t.Fatalf("hintIPsFromEnv(4) = %v", got)
+	}
+}
+
+func TestExtendHintSubnetsLearnsFromMatchingRTTResults(t *testing.T) {
+	got := extendHintSubnets(
+		[]string{"162.159.38.0/24"},
+		[]RTTResult{{IP: "162.159.39.76"}, {IP: "162.159.39.195"}},
+		4,
+	)
+	if len(got) != 2 || got[0] != "162.159.38.0/24" || got[1] != "162.159.39.0/24" {
+		t.Fatalf("extendHintSubnets() = %v", got)
+	}
+}

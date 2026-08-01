@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"html/template"
 	"strings"
 	"testing"
@@ -84,6 +86,43 @@ func TestRunSummaryFreezesStrictLocationAndCounts(t *testing.T) {
 		if !strings.Contains(summary, required) {
 			t.Fatalf("run summary %q does not contain %q", summary, required)
 		}
+	}
+}
+
+func TestRegionalHintSubnetsUseMatchingHistoricalResults(t *testing.T) {
+	app := &App{store: &Store{state: AppState{Results: []IPTestResult{
+		{IP: "162.159.39.76", IPVersion: 4, DataCenterCountry: "JP", DataCenterCity: "Tokyo"},
+		{IP: "162.159.39.195", IPVersion: 4, DataCenterCountry: "JP", DataCenterCity: "Tokyo"},
+		{IP: "104.16.0.1", IPVersion: 4, DataCenterCountry: "US", DataCenterCity: "Los Angeles"},
+		{IP: "2606:4700:52::1", IPVersion: 6, DataCenterCountry: "JP", DataCenterCity: "Tokyo"},
+	}}}}
+	settings := Settings{LocationMode: "strict", LocationCountry: "JP"}
+	got := app.regionalHintSubnets(settings, 4)
+	if len(got) != 1 || got[0] != "162.159.39.0/24" {
+		t.Fatalf("regionalHintSubnets() = %v", got)
+	}
+	history := app.regionalHistoryIPs(settings, 4, map[string]bool{"162.159.39.76": true})
+	if len(history) != 1 || history[0] != "162.159.39.195" {
+		t.Fatalf("regionalHistoryIPs() = %v", history)
+	}
+}
+
+func TestScheduledRunSummaryUsesScheduledTrigger(t *testing.T) {
+	settings := defaultSettings()
+	if got := runSummary("scheduled", settings, GeoFilterStats{}); !strings.Contains(got, "定时执行") {
+		t.Fatalf("scheduled summary = %q", got)
+	}
+}
+
+func TestFamilyTimeoutDoesNotAbortOtherFamily(t *testing.T) {
+	ctx := context.Background()
+	if shouldAbortWholeRun(ctx, errors.New("IPv4 连续 30 分钟无新增结果")) {
+		t.Fatal("a family-level failure must not abort the other IP family")
+	}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if !shouldAbortWholeRun(canceled, context.Canceled) {
+		t.Fatal("a canceled whole-run context must abort immediately")
 	}
 }
 
