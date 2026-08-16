@@ -136,7 +136,10 @@ func runIPSelector(ipType int, useTLS bool) {
 	speed := bandwidth * 128
 	startTime := time.Now()
 	filter := locationFilterFromEnv()
-	if filter.Enabled() {
+	manualConfigured := len(ipListFromEnv("BETTER_CF_MANUAL_HINT_IPS", ipType, 1)) > 0 || len(subnetListFromEnv("BETTER_CF_MANUAL_HINT_SUBNETS", ipType)) > 0
+	if filter.Enabled() && manualConfigured {
+		fmt.Println("手动最高优先范围已设置：国家、地区和城市筛选本轮不参与；仍执行 RTT、带宽和真连接准入。")
+	} else if filter.Enabled() {
 		fmt.Println("地区筛选:", filter.Summary())
 	}
 
@@ -186,12 +189,13 @@ func cloudflareTest(ipType int, useTLS bool, taskNum int, speed int, maxRTTMs in
 		manualHintSubnets = extendHintSubnets(manualHintSubnets, []RTTResult{{IP: seed}}, ipType)
 	}
 	manualExclusive := len(manualSeedIPs) > 0 || len(manualHintSubnets) > 0
-	if filter.Enabled() {
-		if manualExclusive {
-			fmt.Printf("已设置手动最高优先范围：本轮暂停历史数据库和原版全局池，只从手动范围生成候选；实际响应机房仍根据 CF-RAY 按 %s 筛选。\n", filter.Summary())
-		} else {
-			fmt.Printf("候选 IP 从历史记忆和原版地址池生成；实际响应机房将根据 CF-RAY 按 %s 筛选。\n", filter.Summary())
+	if manualExclusive {
+		if filter.Enabled() {
+			fmt.Printf("手动范围覆盖地理条件：已忽略 %s；候选不会再因 CF-RAY 国家、地区或城市不符而淘汰。\n", filter.Summary())
 		}
+		filter = locationFilter{Mode: "any"}
+	} else if filter.Enabled() {
+		fmt.Printf("候选 IP 从历史记忆和原版地址池生成；实际响应机房将根据 CF-RAY 按 %s 筛选。\n", filter.Summary())
 	}
 	hintSubnets := hintSubnetsFromEnv(ipType)
 	if len(hintSubnets) > 0 && !manualExclusive {
@@ -199,7 +203,7 @@ func cloudflareTest(ipType int, useTLS bool, taskNum int, speed int, maxRTTMs in
 	}
 	historyIPs := hintIPsFromEnv(ipType)
 	if manualExclusive {
-		fmt.Printf("手动最高优先执行契约已加载：种子 IP %d 个、种子窄网段/父网段 %d 个；先精确复测种子，之后每批 100%% 来自手动范围，历史数据库与全局池本轮不参与。\n", len(manualSeedIPs), len(manualHintSubnets))
+		fmt.Printf("手动最高优先执行契约已加载：种子 IP %d 个、种子窄网段/父网段 %d 个；先精确复测种子，之后每批 100%% 来自手动范围；历史数据库、全局池及地理过滤本轮不参与。RTT、带宽和真连接仍须达标。\n", len(manualSeedIPs), len(manualHintSubnets))
 		historyIPs = nil
 		hintSubnets = nil
 	}

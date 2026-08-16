@@ -159,6 +159,7 @@ func TestRunPlanFreezesManualPriorityPrefixAndCandidateBudget(t *testing.T) {
 	settings := defaultSettings()
 	settings.IPv4Enabled, settings.IPv4Count = true, 10
 	settings.IPv6Enabled, settings.IPv6Count = false, 0
+	settings.LocationMode, settings.LocationCountry = "strict", "JP"
 	profileID, err := memory.EnsureProfile(context.Background(), searchProfileForSettings(settings, 4))
 	if err != nil {
 		t.Fatal(err)
@@ -189,6 +190,9 @@ func TestRunPlanFreezesManualPriorityPrefixAndCandidateBudget(t *testing.T) {
 	if len(run.Plan.SearchFamilies) != 1 || run.Plan.SearchFamilies[0].ManualPrefixes[0] != "172.66.0.0/16" {
 		t.Fatalf("decorated frozen plan = %+v", run.Plan.SearchFamilies)
 	}
+	if !strings.Contains(run.Summary, "已覆盖国家/地区/城市限制") || strings.Contains(run.Summary, "严格地区") {
+		t.Fatalf("manual run location summary = %q", run.Summary)
+	}
 }
 
 func TestRegionalHintSubnetsUseMatchingHistoricalResults(t *testing.T) {
@@ -206,6 +210,30 @@ func TestRegionalHintSubnetsUseMatchingHistoricalResults(t *testing.T) {
 	history := app.regionalHistoryIPs(settings, 4, map[string]bool{"162.159.39.76": true})
 	if len(history) != 1 || history[0] != "162.159.39.195" {
 		t.Fatalf("regionalHistoryIPs() = %v", history)
+	}
+}
+
+func TestManualGeoOverrideBypassesWebStageLocationRecheck(t *testing.T) {
+	memory, err := searchmemory.Open(t.TempDir() + "/search.sqlite")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer memory.Close()
+	settings := defaultSettings()
+	settings.LocationMode, settings.LocationCountry = "strict", "JP"
+	profileID, err := memory.EnsureProfile(context.Background(), searchProfileForSettings(settings, 4))
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := &App{searchMemory: memory}
+	item := scannerStageObservation{Stage: "region_match", IP: "172.66.130.10", IPVersion: 4, DataCenterCode: "LAX", DataCenterCountry: "US", RTTMs: 80}
+	_, strictCounts := app.recordScannerStageObservations("strict", profileID, settings, false, 4, nil, []string{"172.66.0.0/16"}, []scannerStageObservation{item})
+	if strictCounts["region_match"] != 0 {
+		t.Fatalf("strict location unexpectedly accepted manual candidate: %+v", strictCounts)
+	}
+	_, manualCounts := app.recordScannerStageObservations("manual", profileID, settings, true, 4, nil, []string{"172.66.0.0/16"}, []scannerStageObservation{item})
+	if manualCounts["region_match"] != 1 {
+		t.Fatalf("manual geographic override did not persist candidate: %+v", manualCounts)
 	}
 }
 
@@ -297,7 +325,7 @@ func TestScannerStageObservationsAreParsedAndHiddenFromUserLog(t *testing.T) {
 }
 
 func TestVersionAndRepositoryAreExposed(t *testing.T) {
-	if appVersion != "v1.3.1" || repositoryURL != "https://github.com/samni728/better-cf" {
+	if appVersion != "v1.3.2" || repositoryURL != "https://github.com/samni728/better-cf" {
 		t.Fatalf("version metadata = %s / %s", appVersion, repositoryURL)
 	}
 	if defaultSettings().SearchNetworkLabel != "213 VPS" {
