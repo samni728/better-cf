@@ -45,7 +45,7 @@ type App struct {
 }
 
 const (
-	appVersion               = "v1.2.0"
+	appVersion               = "v1.2.1"
 	repositoryURL            = "https://github.com/samni728/better-cf"
 	scannerObservationPrefix = "@@BETTER_CF_OBSERVATION@@"
 )
@@ -175,6 +175,7 @@ type RunRecord struct {
 	ConfirmedDNSTargetCount int                   `json:"confirmed_dns_target_count,omitempty"`
 	DNSStatus               string                `json:"dns_status,omitempty"`
 	ConfigSnapshot          *Settings             `json:"config_snapshot,omitempty"`
+	SearchPlanSnapshot      []RunSearchFamilyPlan `json:"search_plan_snapshot,omitempty"`
 	DNSTargetResults        []DNSTargetSyncResult `json:"dns_target_results,omitempty"`
 	StartedAt               string                `json:"started_at"`
 	FinishedAt              string                `json:"finished_at,omitempty"`
@@ -199,6 +200,19 @@ type RunPlanView struct {
 	IPv6RecordCount    int
 	ActiveTargets      []RunPlanTargetView
 	SkippedTargets     []RunPlanTargetView
+	SearchFamilies     []RunSearchFamilyPlan
+}
+
+type RunSearchFamilyPlan struct {
+	IPVersion          int                          `json:"ip_version"`
+	Available          bool                         `json:"available"`
+	ManualPrefixes     []string                     `json:"manual_prefixes,omitempty"`
+	ExactIPCount       int                          `json:"exact_ip_count"`
+	NarrowHintCount    int                          `json:"narrow_hint_count"`
+	WideHintCount      int                          `json:"wide_hint_count"`
+	CoolingIPCount     int                          `json:"cooling_ip_count"`
+	CoolingPrefixCount int                          `json:"cooling_prefix_count"`
+	Budget             searchmemory.CandidateBudget `json:"budget"`
 }
 
 type GeoFilterStats struct {
@@ -964,6 +978,10 @@ func cloneRunRecords(runs []RunRecord) []RunRecord {
 	for i := range cloned {
 		cloned[i].Logs = append([]RunLog(nil), runs[i].Logs...)
 		cloned[i].DNSTargetResults = append([]DNSTargetSyncResult(nil), runs[i].DNSTargetResults...)
+		cloned[i].SearchPlanSnapshot = append([]RunSearchFamilyPlan(nil), runs[i].SearchPlanSnapshot...)
+		for j := range cloned[i].SearchPlanSnapshot {
+			cloned[i].SearchPlanSnapshot[j].ManualPrefixes = append([]string(nil), runs[i].SearchPlanSnapshot[j].ManualPrefixes...)
+		}
 		if runs[i].ConfigSnapshot != nil {
 			snapshot := cloneSettings(*runs[i].ConfigSnapshot)
 			cloned[i].ConfigSnapshot = &snapshot
@@ -1665,6 +1683,10 @@ func (s *Store) removeManualDNSTarget(id string) error {
 }
 
 func (s *Store) createRun(trigger string, settings Settings, geoStats GeoFilterStats) (RunRecord, error) {
+	return s.createRunWithSearchPlan(trigger, settings, geoStats, nil)
+}
+
+func (s *Store) createRunWithSearchPlan(trigger string, settings Settings, geoStats GeoFilterStats, searchPlan []RunSearchFamilyPlan) (RunRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	configSnapshot := sanitizedRunSettings(settings)
@@ -1680,6 +1702,7 @@ func (s *Store) createRun(trigger string, settings Settings, geoStats GeoFilterS
 		PlannedDNSTargetCount:  plannedDNSTargetCount(settings),
 		DNSStatus:              "pending",
 		ConfigSnapshot:         &configSnapshot,
+		SearchPlanSnapshot:     cloneRunSearchPlan(searchPlan),
 		StartedAt:              nowString(),
 		Summary:                runSummary(trigger, settings, geoStats),
 		Logs: []RunLog{{
@@ -1693,6 +1716,14 @@ func (s *Store) createRun(trigger string, settings Settings, geoStats GeoFilterS
 		s.state.Runs = s.state.Runs[:50]
 	}
 	return run, s.saveLocked()
+}
+
+func cloneRunSearchPlan(searchPlan []RunSearchFamilyPlan) []RunSearchFamilyPlan {
+	cloned := append([]RunSearchFamilyPlan(nil), searchPlan...)
+	for i := range cloned {
+		cloned[i].ManualPrefixes = append([]string(nil), searchPlan[i].ManualPrefixes...)
+	}
+	return cloned
 }
 
 func (s *Store) updateRunProgress(id, stage string, progress, updatedIPs, syncedIPs int, dnsStatus string) {
@@ -2572,7 +2603,8 @@ func (a *App) startRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	geoStats := a.geoFilterStats(state.Settings)
-	run, err := a.store.createRun("manual", state.Settings, geoStats)
+	searchPlan := a.buildRunSearchPlanSnapshot(r.Context(), state.Settings)
+	run, err := a.store.createRunWithSearchPlan("manual", state.Settings, geoStats, searchPlan)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -2608,7 +2640,8 @@ func (a *App) resumeRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	geoStats := a.geoFilterStats(resumeSettings)
-	run, err := a.store.createRun("resume", resumeSettings, geoStats)
+	searchPlan := a.buildRunSearchPlanSnapshot(r.Context(), resumeSettings)
+	run, err := a.store.createRunWithSearchPlan("resume", resumeSettings, geoStats, searchPlan)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -2808,7 +2841,8 @@ func (a *App) schedulerLoop() {
 			continue
 		}
 		geoStats := a.geoFilterStats(state.Settings)
-		run, err := a.store.createRun("scheduled", state.Settings, geoStats)
+		searchPlan := a.buildRunSearchPlanSnapshot(context.Background(), state.Settings)
+		run, err := a.store.createRunWithSearchPlan("scheduled", state.Settings, geoStats, searchPlan)
 		if err != nil {
 			log.Printf("scheduled run create failed: %v", err)
 			continue
@@ -2828,6 +2862,9 @@ func (a *App) collectFamilyResults(ctx context.Context, id string, settings Sett
 		if loaded, err := a.searchMemory.Candidates(ctx, profileID, ipVersion, time.Now()); err == nil {
 			memory = loaded
 			a.store.appendRunLog(id, "info", fmt.Sprintf("搜索记忆已加载：可复测的真连接/带宽候选 IP %d 个、实测地区优先网段 %d 个（手动 %d 个）、冷却 IP %d 个、冷却网段 %d 个；本轮预算 精确:%d%% /24或/48:%d%% /16或/32:%d%% 全局:%d%%。", len(memory.SuccessIPs), len(memory.HintPrefixes), len(memory.ManualPrefixes), len(memory.ExcludeIPs), len(memory.ExcludePrefixes), memory.Budget.Exact, memory.Budget.Narrow, memory.Budget.Wide, memory.Budget.Global))
+			if len(memory.ManualPrefixes) > 0 {
+				a.store.appendRunLog(id, "info", fmt.Sprintf("本轮确认使用手动优先父网段：%s；它们按父网段预算优先探索，但不会关闭窄网段和全局候选。", strings.Join(memory.ManualPrefixes, "、")))
+			}
 		} else {
 			a.store.appendRunLog(id, "warn", "搜索记忆读取失败，本轮退回无记忆扫描："+err.Error())
 		}
@@ -3589,6 +3626,51 @@ func (a *App) ensureSearchProfile(settings Settings, ipVersion int) string {
 		return ""
 	}
 	return id
+}
+
+func (a *App) buildRunSearchPlanSnapshot(ctx context.Context, settings Settings) []RunSearchFamilyPlan {
+	versions := []int{4, 6}
+	plans := make([]RunSearchFamilyPlan, 0, 2)
+	for _, version := range versions {
+		if (version == 4 && activeIPv4Count(settings) == 0) || (version == 6 && activeIPv6Count(settings) == 0) {
+			continue
+		}
+		plan := RunSearchFamilyPlan{IPVersion: version}
+		profileID := a.ensureSearchProfile(settings, version)
+		if profileID == "" || a.searchMemory == nil {
+			plans = append(plans, plan)
+			continue
+		}
+		memory, err := a.searchMemory.Candidates(ctx, profileID, version, time.Now())
+		if err != nil {
+			log.Printf("build run search plan failed: %v", err)
+			plans = append(plans, plan)
+			continue
+		}
+		plan.Available = true
+		plan.ManualPrefixes = append([]string(nil), memory.ManualPrefixes...)
+		plan.ExactIPCount = len(memory.SuccessIPs)
+		plan.CoolingIPCount = len(memory.ExcludeIPs)
+		plan.CoolingPrefixCount = len(memory.ExcludePrefixes)
+		plan.Budget = memory.Budget
+		narrowBits := 48
+		if version == 4 {
+			narrowBits = 24
+		}
+		for _, raw := range memory.HintPrefixes {
+			prefix, err := netip.ParsePrefix(raw)
+			if err != nil {
+				continue
+			}
+			if prefix.Bits() >= narrowBits {
+				plan.NarrowHintCount++
+			} else {
+				plan.WideHintCount++
+			}
+		}
+		plans = append(plans, plan)
+	}
+	return plans
 }
 
 func importLegacySearchMemory(memory *searchmemory.Store, results []IPTestResult) error {
@@ -4916,6 +4998,7 @@ func decorateRunPlan(run *RunRecord) {
 		return
 	}
 	run.Plan = buildRunPlan(*run.ConfigSnapshot)
+	run.Plan.SearchFamilies = cloneRunSearchPlan(run.SearchPlanSnapshot)
 }
 
 func hasRunningRun(runs []RunRecord) bool {
@@ -6000,7 +6083,7 @@ const settingsTemplate = `
 
         <div class="subsection" style="margin-top:16px">
           <div class="row" style="justify-content:space-between; align-items:flex-end">
-            <div><strong>手动优先父网段</strong><div class="muted">IPv4 只接受 <code>/16</code>，IPv6 只接受 <code>/32</code>。</div></div>
+            <div><strong>手动优先父网段</strong><div class="muted">IPv4 只接受 <code>/16</code>，IPv6 只接受 <code>/32</code>。输入网段内任意地址后会自动规范化：例如 <code>172.66.130.219/16</code> 会保存并显示为 <code>172.66.0.0/16</code>。</div></div>
             <form method="post" action="/search-memory/prefix/add" class="row">
               <input type="hidden" name="profile_id" value="{{$insight.ID}}">
               <input type="hidden" name="ip_version" value="{{$profile.IPVersion}}">
@@ -6500,6 +6583,24 @@ const runsTemplate = `
         <div class="metric"><span>真连接准入条件</span><strong>{{.TrueConnectionText}}</strong></div>
         <div class="metric"><span>本轮 DNS 写入与复核</span><strong>{{.DNSHeadline}}</strong></div>
       </div>
+      {{if .SearchFamilies}}
+        <strong class="section-title">本轮冻结的候选来源与优先网段</strong>
+        <div class="grid">
+          {{range .SearchFamilies}}
+            <div class="metric">
+              <span>IPv{{.IPVersion}} 搜索记忆</span>
+              {{if .Available}}
+                <strong>{{if .ManualPrefixes}}手动优先：{{range .ManualPrefixes}}<code>{{.}}</code> {{end}}{{else}}未设置手动优先父网段{{end}}</strong>
+                <p class="muted">可复测 IP {{.ExactIPCount}}；窄网段 {{.NarrowHintCount}}；父网段 {{.WideHintCount}}；冷却 IP {{.CoolingIPCount}} / 网段 {{.CoolingPrefixCount}}</p>
+                <p class="muted">本轮候选预算：精确 {{.Budget.Exact}}% · 窄网段 {{.Budget.Narrow}}% · 父网段 {{.Budget.Wide}}% · 全局 {{.Budget.Global}}%</p>
+              {{else}}
+                <strong>本轮没有可读取的搜索记忆</strong>
+              {{end}}
+            </div>
+          {{end}}
+        </div>
+        <p class="muted">这里显示的是任务创建时冻结的搜索计划。手动父网段会优先参与候选生成，但仍保留全局探索预算；最终仍须通过 CF-RAY 地区、RTT、带宽和已启用的真连接条件。</p>
+      {{end}}
       {{if .ActiveTargets}}
         <strong class="section-title">实际参与本轮 DNS 的目标</strong>
         <ul class="compact-list">

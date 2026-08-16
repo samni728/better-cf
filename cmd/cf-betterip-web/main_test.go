@@ -14,6 +14,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"cf-betterip-ser/internal/searchmemory"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -148,6 +150,44 @@ func TestRunPlanSeparatesConfiguredFamiliesFromCurrentExecution(t *testing.T) {
 	}
 }
 
+func TestRunPlanFreezesManualPriorityPrefixAndCandidateBudget(t *testing.T) {
+	memory, err := searchmemory.Open(t.TempDir() + "/search.sqlite")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer memory.Close()
+	settings := defaultSettings()
+	settings.IPv4Enabled, settings.IPv4Count = true, 10
+	settings.IPv6Enabled, settings.IPv6Count = false, 0
+	profileID, err := memory.EnsureProfile(context.Background(), searchProfileForSettings(settings, 4))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prefix, err := memory.AddManualPrefix(context.Background(), profileID, 4, "172.66.130.219/16"); err != nil || prefix != "172.66.0.0/16" {
+		t.Fatalf("manual prefix = %q, %v", prefix, err)
+	}
+	app := &App{searchMemory: memory}
+	searchPlan := app.buildRunSearchPlanSnapshot(context.Background(), settings)
+	if len(searchPlan) != 1 || !searchPlan[0].Available || !reflect.DeepEqual(searchPlan[0].ManualPrefixes, []string{"172.66.0.0/16"}) {
+		t.Fatalf("search plan = %+v", searchPlan)
+	}
+	if searchPlan[0].WideHintCount != 1 || searchPlan[0].Budget.Global == 0 {
+		t.Fatalf("search plan counts/budget = %+v", searchPlan[0])
+	}
+	store, err := NewStore(t.TempDir() + "/app_state.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.createRunWithSearchPlan("manual", settings, GeoFilterStats{}, searchPlan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decorateRunPlan(&run)
+	if len(run.Plan.SearchFamilies) != 1 || run.Plan.SearchFamilies[0].ManualPrefixes[0] != "172.66.0.0/16" {
+		t.Fatalf("decorated frozen plan = %+v", run.Plan.SearchFamilies)
+	}
+}
+
 func TestRegionalHintSubnetsUseMatchingHistoricalResults(t *testing.T) {
 	app := &App{store: &Store{state: AppState{Results: []IPTestResult{
 		{IP: "162.159.39.76", IPVersion: 4, DataCenterCountry: "JP", DataCenterCity: "Tokyo"},
@@ -254,7 +294,7 @@ func TestScannerStageObservationsAreParsedAndHiddenFromUserLog(t *testing.T) {
 }
 
 func TestVersionAndRepositoryAreExposed(t *testing.T) {
-	if appVersion != "v1.2.0" || repositoryURL != "https://github.com/samni728/better-cf" {
+	if appVersion != "v1.2.1" || repositoryURL != "https://github.com/samni728/better-cf" {
 		t.Fatalf("version metadata = %s / %s", appVersion, repositoryURL)
 	}
 	if defaultSettings().SearchNetworkLabel != "213 VPS" {
