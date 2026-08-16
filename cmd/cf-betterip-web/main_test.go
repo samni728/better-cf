@@ -195,6 +195,103 @@ func TestRunPlanFreezesManualPriorityPrefixAndCandidateBudget(t *testing.T) {
 	}
 }
 
+func TestFamilyExecutionPolicyKeepsIPv4AndIPv6Independent(t *testing.T) {
+	settings := defaultSettings()
+	settings.IPv4Enabled, settings.IPv4Count = true, 10
+	settings.IPv6Enabled, settings.IPv6Count = true, 10
+	settings.LocationMode, settings.LocationCountry = "strict", "JP"
+	settings.TrueConnectionIPv4 = true
+	settings.TrueConnectionIPv6 = false
+
+	ipv4Plan := RunSearchFamilyPlan{
+		IPVersion:          4,
+		Available:          true,
+		ManualPrefixes:     []string{"172.66.0.0/16"},
+		ManualSeedIPs:      []string{"172.66.130.219"},
+		ManualHintPrefixes: []string{"172.66.130.0/24", "172.66.0.0/16"},
+		ManualExclusive:    true,
+	}
+	ipv6Plan := RunSearchFamilyPlan{IPVersion: 6, Available: true}
+
+	ipv4Policy := familyExecutionPolicy(settings, ipv4Plan, 4)
+	if !ipv4Policy.ManualExclusive || ipv4Policy.UseHistoryAndGlobal || ipv4Policy.ApplyLocationFilter || !ipv4Policy.RunTrueConnection {
+		t.Fatalf("IPv4 policy crossed a boundary: %+v", ipv4Policy)
+	}
+	ipv6Policy := familyExecutionPolicy(settings, ipv6Plan, 6)
+	if ipv6Policy.ManualExclusive || !ipv6Policy.UseHistoryAndGlobal || !ipv6Policy.ApplyLocationFilter || ipv6Policy.RunTrueConnection {
+		t.Fatalf("IPv6 policy crossed a boundary: %+v", ipv6Policy)
+	}
+
+	applyFamilyPolicyLabels(settings, &ipv4Plan)
+	applyFamilyPolicyLabels(settings, &ipv6Plan)
+	if !strings.Contains(ipv4Plan.CandidatePolicy, "仅手动范围") || !strings.Contains(ipv4Plan.LocationPolicy, "忽略") || !strings.Contains(ipv4Plan.TrueConnectPolicy, "执行") {
+		t.Fatalf("IPv4 labels are ambiguous: %+v", ipv4Plan)
+	}
+	if !strings.Contains(ipv6Plan.CandidatePolicy, "历史库存优先") || !strings.Contains(ipv6Plan.LocationPolicy, "JP") || ipv6Plan.TrueConnectPolicy != "不执行真连接" {
+		t.Fatalf("IPv6 labels are ambiguous: %+v", ipv6Plan)
+	}
+	locationSummary := effectiveLocationSummary(settings, GeoFilterStats{}, []RunSearchFamilyPlan{ipv4Plan, ipv6Plan})
+	if !strings.Contains(locationSummary, "IPv4") || !strings.Contains(locationSummary, "IPv6") || !strings.Contains(locationSummary, "严格地区") {
+		t.Fatalf("mixed family location summary = %q", locationSummary)
+	}
+}
+
+func TestBuildRunSearchPlanSeparatesManualIPv4FromInventoryIPv6(t *testing.T) {
+	memory, err := searchmemory.Open(t.TempDir() + "/search.sqlite")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer memory.Close()
+	settings := defaultSettings()
+	settings.IPv4Enabled, settings.IPv4Count = true, 10
+	settings.IPv6Enabled, settings.IPv6Count = true, 10
+	settings.LocationMode, settings.LocationCountry = "strict", "JP"
+	settings.TrueConnectionIPv4 = true
+	settings.TrueConnectionIPv6 = false
+
+	ipv4ProfileID, err := memory.EnsureProfile(context.Background(), searchProfileForSettings(settings, 4))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := memory.AddManualPrefix(context.Background(), ipv4ProfileID, 4, "172.66.130.219/16"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := memory.EnsureProfile(context.Background(), searchProfileForSettings(settings, 6)); err != nil {
+		t.Fatal(err)
+	}
+
+	app := &App{searchMemory: memory}
+	plans := app.buildRunSearchPlanSnapshot(context.Background(), settings)
+	if len(plans) != 2 {
+		t.Fatalf("family plans = %+v", plans)
+	}
+	ipv4Plan := searchPlanForFamily(plans, 4)
+	ipv6Plan := searchPlanForFamily(plans, 6)
+	if !ipv4Plan.ManualExclusive || !strings.Contains(ipv4Plan.CandidatePolicy, "仅手动范围") || !strings.Contains(ipv4Plan.LocationPolicy, "忽略") || !strings.Contains(ipv4Plan.TrueConnectPolicy, "执行") {
+		t.Fatalf("IPv4 frozen plan = %+v", ipv4Plan)
+	}
+	if ipv6Plan.ManualExclusive || !strings.Contains(ipv6Plan.CandidatePolicy, "历史库存优先") || !strings.Contains(ipv6Plan.LocationPolicy, "JP") || ipv6Plan.TrueConnectPolicy != "不执行真连接" {
+		t.Fatalf("IPv6 frozen plan = %+v", ipv6Plan)
+	}
+}
+
+func TestFrozenManualPlanSurvivesSearchMemoryReadFailure(t *testing.T) {
+	plan := RunSearchFamilyPlan{
+		IPVersion:          4,
+		Available:          true,
+		ManualPrefixes:     []string{"172.66.0.0/16"},
+		ManualSeedIPs:      []string{"172.66.130.219"},
+		ManualHintPrefixes: []string{"172.66.130.0/24", "172.66.0.0/16"},
+		ManualExclusive:    true,
+		Budget:             searchmemory.CandidateBudget{Exact: 24, Narrow: 21, Wide: 29, Global: 26},
+	}
+	memory := searchmemory.CandidateMemory{}
+	applyFrozenManualPlan(&memory, plan)
+	if !reflect.DeepEqual(memory.ManualPrefixes, plan.ManualPrefixes) || !reflect.DeepEqual(memory.ManualSeedIPs, plan.ManualSeedIPs) || !reflect.DeepEqual(memory.ManualHintPrefixes, plan.ManualHintPrefixes) || memory.Budget != plan.Budget {
+		t.Fatalf("frozen manual plan was not restored: %+v", memory)
+	}
+}
+
 func TestRegionalHintSubnetsUseMatchingHistoricalResults(t *testing.T) {
 	app := &App{store: &Store{state: AppState{Results: []IPTestResult{
 		{IP: "162.159.39.76", IPVersion: 4, DataCenterCountry: "JP", DataCenterCity: "Tokyo"},
@@ -325,7 +422,7 @@ func TestScannerStageObservationsAreParsedAndHiddenFromUserLog(t *testing.T) {
 }
 
 func TestVersionAndRepositoryAreExposed(t *testing.T) {
-	if appVersion != "v1.3.2" || repositoryURL != "https://github.com/samni728/better-cf" {
+	if appVersion != "v1.3.3" || repositoryURL != "https://github.com/samni728/better-cf" {
 		t.Fatalf("version metadata = %s / %s", appVersion, repositoryURL)
 	}
 	if defaultSettings().SearchNetworkLabel != "213 VPS" {
