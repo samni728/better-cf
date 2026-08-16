@@ -190,9 +190,6 @@ cmd/cf-betterip-web/
 main.go
   上游 better-cloudflare-ip CLI 测速逻辑
 
-docs/
-  产品设计、架构、DNS 同步、数据模型、WebUI 工作流等文档
-
 scripts/
   本地运行与从 VPS 同步源码的辅助脚本
 ```
@@ -370,18 +367,7 @@ http://服务器IP:18080
 - VPS 密码
 - 管理员账号数据
 
-本仓库只应该保存源码、文档和可复用脚本。
-
-## 开发文档
-
-详细设计请查看：
-
-- [`docs/product-design.md`](docs/product-design.md)
-- [`docs/architecture.md`](docs/architecture.md)
-- [`docs/dns-sync.md`](docs/dns-sync.md)
-- [`docs/data-model.md`](docs/data-model.md)
-- [`docs/webui-workflows.md`](docs/webui-workflows.md)
-- [`docs/sync-policy.md`](docs/sync-policy.md)
+本仓库只公开源码和可复用脚本。项目内部设计、部署及运维文档保存在本地 `docs/`，不会同步到 GitHub。
 
 ## 免责声明
 

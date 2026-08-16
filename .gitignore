@@ -1,5 +1,6 @@
 # Local notes and secrets
 memo.md
+docs/
 .env
 .env.*
 !.env.example
