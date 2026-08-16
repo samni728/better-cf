@@ -180,24 +180,36 @@ func cloudflareTest(ipType int, useTLS bool, taskNum int, speed int, maxRTTMs in
 		return "", 0, 0, ""
 	}
 	fmt.Printf("已加载原版 IPv%d Cloudflare Anycast 地址池，共 %d 个子网。\n", ipType, len(ipList))
+	manualSeedIPs := ipListFromEnv("BETTER_CF_MANUAL_HINT_IPS", ipType, 50)
+	manualHintSubnets := subnetListFromEnv("BETTER_CF_MANUAL_HINT_SUBNETS", ipType)
+	for _, seed := range manualSeedIPs {
+		manualHintSubnets = extendHintSubnets(manualHintSubnets, []RTTResult{{IP: seed}}, ipType)
+	}
+	manualExclusive := len(manualSeedIPs) > 0 || len(manualHintSubnets) > 0
 	if filter.Enabled() {
-		fmt.Printf("候选 IP 仍从原版地址池生成；实际响应机房将根据 CF-RAY 按 %s 筛选。\n", filter.Summary())
+		if manualExclusive {
+			fmt.Printf("已设置手动最高优先范围：本轮暂停历史数据库和原版全局池，只从手动范围生成候选；实际响应机房仍根据 CF-RAY 按 %s 筛选。\n", filter.Summary())
+		} else {
+			fmt.Printf("候选 IP 从历史记忆和原版地址池生成；实际响应机房将根据 CF-RAY 按 %s 筛选。\n", filter.Summary())
+		}
 	}
 	hintSubnets := hintSubnetsFromEnv(ipType)
-	if len(hintSubnets) > 0 {
+	if len(hintSubnets) > 0 && !manualExclusive {
 		fmt.Printf("已从历史地区命中、带宽及真连接结果提取 %d 个 IPv%d 优先网段，每轮会先按父网段广泛探索，再从命中的窄网段深挖。\n", len(hintSubnets), ipType)
 	}
 	historyIPs := hintIPsFromEnv(ipType)
-	manualSeedIPs := ipListFromEnv("BETTER_CF_MANUAL_HINT_IPS", ipType, 50)
-	manualHintSubnets := subnetListFromEnv("BETTER_CF_MANUAL_HINT_SUBNETS", ipType)
-	if len(manualSeedIPs) > 0 || len(manualHintSubnets) > 0 {
-		fmt.Printf("手动优先执行契约已加载：种子 IP %d 个、种子窄网段/父网段 %d 个；先精确复测种子，每批候选至少 40%% 来自手动范围。\n", len(manualSeedIPs), len(manualHintSubnets))
+	if manualExclusive {
+		fmt.Printf("手动最高优先执行契约已加载：种子 IP %d 个、种子窄网段/父网段 %d 个；先精确复测种子，之后每批 100%% 来自手动范围，历史数据库与全局池本轮不参与。\n", len(manualSeedIPs), len(manualHintSubnets))
+		historyIPs = nil
+		hintSubnets = nil
 	}
 	budget := candidateBudgetFromEnv()
 	excludeIPs := ipSetFromEnv("BETTER_CF_EXCLUDE_IPS", ipType)
 	excludePrefixes := prefixListFromEnv("BETTER_CF_EXCLUDE_SUBNETS", ipType)
-	if len(excludeIPs) > 0 || len(excludePrefixes) > 0 {
+	if (len(excludeIPs) > 0 || len(excludePrefixes) > 0) && !manualExclusive {
 		fmt.Printf("搜索记忆冷却生效：跳过 %d 个近期失败 IP、%d 个近期失败网段。\n", len(excludeIPs), len(excludePrefixes))
+	} else if manualExclusive && (len(excludeIPs) > 0 || len(excludePrefixes) > 0) {
+		fmt.Printf("数据库中有 %d 个冷却 IP、%d 个冷却网段，但手动最高优先范围会覆盖这些自动冷却。\n", len(excludeIPs), len(excludePrefixes))
 	}
 	if len(historyIPs) > 0 {
 		historyIPs = filterCandidateIPs(historyIPs, excludeIPs, excludePrefixes)
@@ -207,11 +219,13 @@ func cloudflareTest(ipType int, useTLS bool, taskNum int, speed int, maxRTTMs in
 		}
 		fmt.Printf("已加载 %d 个同地区历史成功 IPv%d，先按当前 RTT、带宽和 CF-RAY 条件重测。\n", len(historyIPs), ipType)
 	}
-	fmt.Printf("自适应候选预算：历史精确 %d%%、窄网段 %d%%、父网段 %d%%、全局探索 %d%%。\n", budget.Exact, budget.Narrow, budget.Wide, budget.Global)
+	if !manualExclusive {
+		fmt.Printf("自适应候选预算：历史精确 %d%%、窄网段 %d%%、父网段 %d%%、全局探索 %d%%。\n", budget.Exact, budget.Narrow, budget.Wide, budget.Global)
+	}
 	subnetSampler := newSubnetSampler(ipList)
 
 	sampleSize := 100
-	if len(ipList) < sampleSize {
+	if !manualExclusive && len(ipList) < sampleSize {
 		sampleSize = len(ipList)
 	}
 
@@ -247,7 +261,11 @@ func cloudflareTest(ipType int, useTLS bool, taskNum int, speed int, maxRTTMs in
 				break
 			}
 			if activeFilter.Enabled() {
-				fmt.Printf("本轮没有符合 %s 且 RTT 达标的响应 IP，继续从原版地址池换一批候选...\n", activeFilter.Summary())
+				if manualExclusive {
+					fmt.Printf("本轮手动范围没有符合 %s 且 RTT 达标的响应 IP，继续只从手动范围换一批候选...\n", activeFilter.Summary())
+				} else {
+					fmt.Printf("本轮没有符合 %s 且 RTT 达标的响应 IP，继续从历史与原版地址池换一批候选...\n", activeFilter.Summary())
+				}
 			} else {
 				fmt.Println("本轮没有 RTT 达标的 Cloudflare 响应 IP，继续换一批候选...")
 			}
@@ -475,7 +493,7 @@ func candidateSubnets(sampler *subnetSampler, hints []string, sampleSize int) []
 	return result
 }
 
-// hierarchicalCandidateIPs 先为用户手动范围保留 40% 候选，再按自适应预算分配历史窄网段、父网段和全局探索。
+// hierarchicalCandidateIPs 在存在用户手动范围时只生成手动候选；没有手动范围时才使用历史与全局自适应预算。
 // IPv4 hint 可同时包含 /24 和 /16；同一 /16 会随机落到不同 /24，找到成功后再由 /24 深挖。
 func hierarchicalCandidateIPs(sampler *subnetSampler, manualHints, hints []string, excludeIPs map[string]bool, excludePrefixes []netip.Prefix, sampleSize, ipType int, budget candidateBudget) []string {
 	if sampleSize <= 0 {
@@ -510,23 +528,20 @@ func hierarchicalCandidateIPs(sampler *subnetSampler, manualHints, hints []strin
 		result = append(result, ip)
 	}
 
-	manualTarget := 0
 	if len(manualHints) > 0 {
-		manualTarget = maxInt(1, sampleSize*40/100)
+		activeManual := append([]string(nil), manualHints...)
+		for attempts := 0; len(result) < sampleSize && attempts < maxInt(1, sampleSize*80); attempts++ {
+			// 用户明确加入的最高优先范围覆盖自动冷却，且不会混入历史数据库或全局地址池。
+			addManual(randomIPFromPrefix(activeManual[attempts%len(activeManual)], ipType))
+		}
+		return result
 	}
-	activeManual := randomSample(manualHints, minInt(len(manualHints), 20))
-	for attempts := 0; len(result) < manualTarget && len(activeManual) > 0 && attempts < maxInt(1, manualTarget*40); attempts++ {
-		// 用户明确加入的优先范围覆盖自动冷却，否则近期失败记忆会让“手动优先”看似配置成功却完全不执行。
-		addManual(randomIPFromPrefix(activeManual[attempts%len(activeManual)], ipType))
-	}
-	manualGenerated := len(result)
-	remainingSize := sampleSize - manualGenerated
 	generatedBudget := budget.Narrow + budget.Wide + budget.Global
 	if generatedBudget <= 0 {
 		generatedBudget = 1
 	}
-	narrowTarget := manualGenerated + remainingSize*budget.Narrow/generatedBudget
-	wideTarget := narrowTarget + remainingSize*budget.Wide/generatedBudget
+	narrowTarget := sampleSize * budget.Narrow / generatedBudget
+	wideTarget := narrowTarget + sampleSize*budget.Wide/generatedBudget
 	var narrowHints, wideHints []string
 	for _, raw := range hints {
 		prefix, err := netip.ParsePrefix(strings.TrimSpace(raw))

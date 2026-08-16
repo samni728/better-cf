@@ -45,7 +45,7 @@ type App struct {
 }
 
 const (
-	appVersion               = "v1.3.0"
+	appVersion               = "v1.3.1"
 	repositoryURL            = "https://github.com/samni728/better-cf"
 	scannerObservationPrefix = "@@BETTER_CF_OBSERVATION@@"
 )
@@ -210,6 +210,7 @@ type RunSearchFamilyPlan struct {
 	ManualSeedIPs      []string                     `json:"manual_seed_ips,omitempty"`
 	ManualHintPrefixes []string                     `json:"manual_hint_prefixes,omitempty"`
 	ManualQuotaPercent int                          `json:"manual_quota_percent,omitempty"`
+	ManualExclusive    bool                         `json:"manual_exclusive,omitempty"`
 	ExactIPCount       int                          `json:"exact_ip_count"`
 	NarrowHintCount    int                          `json:"narrow_hint_count"`
 	WideHintCount      int                          `json:"wide_hint_count"`
@@ -2872,7 +2873,7 @@ func (a *App) collectFamilyResults(ctx context.Context, id string, settings Sett
 			manualSeedIPsPending = append([]string(nil), memory.ManualSeedIPs...)
 			a.store.appendRunLog(id, "info", fmt.Sprintf("搜索记忆已加载：可复测的真连接/带宽候选 IP %d 个、实测地区优先网段 %d 个（手动 %d 个）、冷却 IP %d 个、冷却网段 %d 个；本轮预算 精确:%d%% /24或/48:%d%% /16或/32:%d%% 全局:%d%%。", len(memory.SuccessIPs), len(memory.HintPrefixes), len(memory.ManualPrefixes), len(memory.ExcludeIPs), len(memory.ExcludePrefixes), memory.Budget.Exact, memory.Budget.Narrow, memory.Budget.Wide, memory.Budget.Global))
 			if len(memory.ManualPrefixes) > 0 {
-				a.store.appendRunLog(id, "info", fmt.Sprintf("手动优先执行契约：父网段 %s；种子 IP %s；推导范围 %s。先精确复测种子，随后每批至少 40%% 候选来自手动范围；手动范围覆盖自动冷却，但仍须通过地区、RTT、带宽和真连接。", strings.Join(memory.ManualPrefixes, "、"), firstNonEmpty(strings.Join(memory.ManualSeedIPs, "、"), "未保存"), strings.Join(memory.ManualHintPrefixes, "、")))
+				a.store.appendRunLog(id, "info", fmt.Sprintf("手动最高优先执行契约：父网段 %s；种子 IP %s；推导范围 %s。先精确复测种子，之后每批 100%% 只从手动范围生成；历史成功 IP、历史网段、全局池和自动冷却本轮均不参与。候选仍须通过地区、RTT、带宽和真连接。", strings.Join(memory.ManualPrefixes, "、"), firstNonEmpty(strings.Join(memory.ManualSeedIPs, "、"), "未保存"), strings.Join(memory.ManualHintPrefixes, "、")))
 			}
 		} else {
 			a.store.appendRunLog(id, "warn", "搜索记忆读取失败，本轮退回无记忆扫描："+err.Error())
@@ -2886,16 +2887,22 @@ func (a *App) collectFamilyResults(ctx context.Context, id string, settings Sett
 		progress := 10 + ((existingCount + len(results)) * 65 / requiredCount)
 		a.store.updateRunProgress(id, stage, progress, existingCount+len(results), 0, "pending")
 		a.store.appendRunLog(id, "info", fmt.Sprintf("IPv%d 第 %d 次尝试，目标收集 %d/%d。", ipVersion, attempt, len(results), targetCount))
-		hintSubnets := append([]string(nil), memory.HintPrefixes...)
-		if len(hintSubnets) == 0 || !trueConnectionEnabledForFamily(settings, ipVersion) {
-			hintSubnets = append(hintSubnets, a.regionalHintSubnets(settings, ipVersion)...)
+		manualExclusive := len(memory.ManualHintPrefixes) > 0
+		var hintSubnets, historyIPs []string
+		if !manualExclusive {
+			hintSubnets = append([]string(nil), memory.HintPrefixes...)
+			if len(hintSubnets) == 0 || !trueConnectionEnabledForFamily(settings, ipVersion) {
+				hintSubnets = append(hintSubnets, a.regionalHintSubnets(settings, ipVersion)...)
+			}
+			historyIPs = append([]string(nil), memory.SuccessIPs...)
+			if !trueConnectionEnabledForFamily(settings, ipVersion) {
+				historyIPs = append(historyIPs, a.regionalHistoryIPs(settings, ipVersion, seen)...)
+			}
+			historyIPs = filterUnseenIPs(historyIPs, seen)
 		}
-		historyIPs := append([]string(nil), memory.SuccessIPs...)
-		if !trueConnectionEnabledForFamily(settings, ipVersion) {
-			historyIPs = append(historyIPs, a.regionalHistoryIPs(settings, ipVersion, seen)...)
-		}
-		historyIPs = filterUnseenIPs(historyIPs, seen)
-		if attempt == 1 && len(hintSubnets) > 0 {
+		if attempt == 1 && manualExclusive {
+			a.store.appendRunLog(id, "info", "搜索顺序已锁定：手动种子 → 手动窄网段 → 手动父网段。数据库历史候选和全局随机池已经暂停，不会排在手动范围前面，也不会混入同一批候选。")
+		} else if attempt == 1 && len(hintSubnets) > 0 {
 			a.store.appendRunLog(id, "info", fmt.Sprintf("两阶段搜索开始：先复测 %d 个 IPv%d 历史候选，并按 %d 个实测线索从父网段 /16（IPv6 /32）广泛探索；一旦命中实际机房，再收窄到 /24（IPv6 /48）深挖。带宽候选合格后才进入 HTTP/HTTPS 真连接。", len(historyIPs), ipVersion, len(hintSubnets)))
 		}
 
@@ -2907,7 +2914,11 @@ func (a *App) collectFamilyResults(ctx context.Context, id string, settings Sett
 		manualSeedIPsPending = nil
 		cancel()
 		stageObservations := parseScannerStageObservations(output)
-		learnedHints, stageCounts := a.recordScannerStageObservations(id, profileID, settings, ipVersion, historyIPs, hintSubnets, stageObservations)
+		observationHints := hintSubnets
+		if manualExclusive {
+			observationHints = memory.ManualHintPrefixes
+		}
+		learnedHints, stageCounts := a.recordScannerStageObservations(id, profileID, settings, ipVersion, historyIPs, observationHints, stageObservations)
 		memory.HintPrefixes = appendUniqueStrings(memory.HintPrefixes, learnedHints...)
 		if stageCounts["region_match"] > 0 {
 			a.store.appendRunLog(id, "info", fmt.Sprintf("阶段记忆已保存：实测地区命中 %d 个，带宽达标 %d 个、未达标 %d 个；已将对应 /24 与 /16（IPv6 为 /48 与 /32）加入后续优先范围。", stageCounts["region_match"], stageCounts["bandwidth_pass"], stageCounts["bandwidth_fail"]))
@@ -2955,7 +2966,7 @@ func (a *App) collectFamilyResults(ctx context.Context, id string, settings Sett
 			result.Protocol = "HTTP"
 		}
 		result.ConfiguredBandwidthMbps = settings.BandwidthMbps
-		result.CandidateSource = candidateSourceForIP(result.IP, historyIPs, hintSubnets, ipVersion)
+		result.CandidateSource = candidateSourceForIP(result.IP, historyIPs, observationHints, ipVersion)
 		if trueConnectionEnabledForFamily(settings, ipVersion) {
 			a.store.appendRunLog(id, "info", fmt.Sprintf("阶段 1 已完成：%s 通过地区、RTT 与带宽门槛，已进入带宽候选池。开始阶段 2 真连接验证；将完整检测所选协议的全部 Cloudflare 端口。", result.IP))
 			ports, portAttempts, trueErr := runTrueConnectionTests(ctx, settings, result.IP)
@@ -3150,11 +3161,12 @@ func runBetterIPScan(ctx context.Context, settings Settings, ipVersion int, manu
 	wroteExit := false
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
-	heartbeat := time.NewTicker(30 * time.Second)
+	heartbeat := time.NewTicker(5 * time.Second)
 	defer heartbeat.Stop()
 	startedAt := time.Now()
 	lastOutputAt := startedAt
 	lastLoggedLen := 0
+	lastHeartbeatLog := startedAt
 	idleLimit := 3 * time.Minute
 
 	writeLine := func(value interface{}) error {
@@ -3202,10 +3214,14 @@ loop:
 				lastLoggedLen = len(output)
 				if strings.TrimSpace(delta) != "" {
 					onLog("脚本实时输出：" + trimForLog(delta, 900))
+					lastHeartbeatLog = time.Now()
 				}
 			} else {
 				idleFor := time.Since(lastOutputAt)
-				onLog(fmt.Sprintf("脚本仍在运行，累计 %d 秒；最近 %d 秒没有新输出。", int(time.Since(startedAt).Seconds()), int(idleFor.Seconds())))
+				if time.Since(lastHeartbeatLog) >= 30*time.Second {
+					onLog(fmt.Sprintf("脚本仍在运行，累计 %d 秒；最近 %d 秒没有新输出。", int(time.Since(startedAt).Seconds()), int(idleFor.Seconds())))
+					lastHeartbeatLog = time.Now()
+				}
 				if idleFor >= idleLimit {
 					_ = cmd.Process.Kill()
 					waitErr = fmt.Errorf("脚本超过 %d 秒没有任何输出，判定为卡住，终止本次尝试并续接下一次", int(idleLimit.Seconds()))
@@ -3664,7 +3680,8 @@ func (a *App) buildRunSearchPlanSnapshot(ctx context.Context, settings Settings)
 		plan.ManualSeedIPs = append([]string(nil), memory.ManualSeedIPs...)
 		plan.ManualHintPrefixes = append([]string(nil), memory.ManualHintPrefixes...)
 		if len(memory.ManualPrefixes) > 0 {
-			plan.ManualQuotaPercent = 40
+			plan.ManualQuotaPercent = 100
+			plan.ManualExclusive = true
 		}
 		plan.ExactIPCount = len(memory.SuccessIPs)
 		plan.CoolingIPCount = len(memory.ExcludeIPs)
@@ -6100,7 +6117,7 @@ const settingsTemplate = `
 
         <div class="subsection" style="margin-top:16px">
           <div class="row" style="justify-content:space-between; align-items:flex-end">
-            <div><strong>手动优先种子与父网段</strong><div class="muted">IPv4 只接受 <code>/16</code>，IPv6 只接受 <code>/32</code>。建议输入已知可用 IP，例如 <code>172.66.130.219/16</code>：系统会保留种子 IP，并推导 <code>172.66.130.0/24</code> 与 <code>172.66.0.0/16</code>。</div></div>
+            <div><strong>手动最高优先种子与父网段</strong><div class="muted">IPv4 只接受 <code>/16</code>，IPv6 只接受 <code>/32</code>。设置后，本轮会暂停数据库历史候选和全局随机池，只测试手动范围。建议输入已知可用 IP，例如 <code>172.66.130.219/16</code>：系统会保留种子 IP，并推导 <code>172.66.130.0/24</code> 与 <code>172.66.0.0/16</code>。</div></div>
             <form method="post" action="/search-memory/prefix/add" class="row">
               <input type="hidden" name="profile_id" value="{{$insight.ID}}">
               <input type="hidden" name="ip_version" value="{{$profile.IPVersion}}">
@@ -6611,7 +6628,8 @@ const runsTemplate = `
 				{{if .ManualSeedIPs}}<p class="muted">先精确复测种子：{{range .ManualSeedIPs}}<code>{{.}}</code> {{end}}</p>{{end}}
 				{{if .ManualHintPrefixes}}<p class="muted">随后深挖范围：{{range .ManualHintPrefixes}}<code>{{.}}</code> {{end}}</p>{{end}}
                 <p class="muted">可复测 IP {{.ExactIPCount}}；窄网段 {{.NarrowHintCount}}；父网段 {{.WideHintCount}}；冷却 IP {{.CoolingIPCount}} / 网段 {{.CoolingPrefixCount}}</p>
-				<p class="muted">{{if .ManualQuotaPercent}}手动范围每批保底 {{.ManualQuotaPercent}}%；其余按自适应预算分配：{{end}}精确 {{.Budget.Exact}}% · 窄网段 {{.Budget.Narrow}}% · 父网段 {{.Budget.Wide}}% · 全局 {{.Budget.Global}}%</p>
+				{{if .ManualExclusive}}<p class="muted">本轮手动范围占 100%；数据库历史与全局池暂停。下面的自适应预算仅供未设置手动范围时使用。</p>{{end}}
+				<p class="muted">数据库自适应预算：精确 {{.Budget.Exact}}% · 窄网段 {{.Budget.Narrow}}% · 父网段 {{.Budget.Wide}}% · 全局 {{.Budget.Global}}%</p>
               {{else}}
                 <strong>本轮没有可读取的搜索记忆</strong>
               {{end}}

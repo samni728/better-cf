@@ -222,8 +222,14 @@ func TestManualPriorityReservesCandidatesAndOverridesCooldown(t *testing.T) {
 	if len(got) != 100 {
 		t.Fatalf("manual candidates returned %d, want 100", len(got))
 	}
-	if count := countIPsInPrefixes(got, manual); count < 40 {
-		t.Fatalf("manual priority count = %d, want at least 40", count)
+	if count := countIPsInPrefixes(got, manual); count != 100 {
+		t.Fatalf("manual priority count = %d, want 100", count)
+	}
+	global := netip.MustParsePrefix("198.51.100.0/24")
+	for _, raw := range got {
+		if global.Contains(netip.MustParseAddr(raw)) {
+			t.Fatalf("global candidate %s leaked into manual-exclusive batch", raw)
+		}
 	}
 	narrow := netip.MustParsePrefix("172.66.130.0/24")
 	foundCooledManual := false
