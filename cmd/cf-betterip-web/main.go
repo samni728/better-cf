@@ -45,7 +45,7 @@ type App struct {
 }
 
 const (
-	appVersion               = "v1.2.1"
+	appVersion               = "v1.3.0"
 	repositoryURL            = "https://github.com/samni728/better-cf"
 	scannerObservationPrefix = "@@BETTER_CF_OBSERVATION@@"
 )
@@ -207,6 +207,9 @@ type RunSearchFamilyPlan struct {
 	IPVersion          int                          `json:"ip_version"`
 	Available          bool                         `json:"available"`
 	ManualPrefixes     []string                     `json:"manual_prefixes,omitempty"`
+	ManualSeedIPs      []string                     `json:"manual_seed_ips,omitempty"`
+	ManualHintPrefixes []string                     `json:"manual_hint_prefixes,omitempty"`
+	ManualQuotaPercent int                          `json:"manual_quota_percent,omitempty"`
 	ExactIPCount       int                          `json:"exact_ip_count"`
 	NarrowHintCount    int                          `json:"narrow_hint_count"`
 	WideHintCount      int                          `json:"wide_hint_count"`
@@ -981,6 +984,8 @@ func cloneRunRecords(runs []RunRecord) []RunRecord {
 		cloned[i].SearchPlanSnapshot = append([]RunSearchFamilyPlan(nil), runs[i].SearchPlanSnapshot...)
 		for j := range cloned[i].SearchPlanSnapshot {
 			cloned[i].SearchPlanSnapshot[j].ManualPrefixes = append([]string(nil), runs[i].SearchPlanSnapshot[j].ManualPrefixes...)
+			cloned[i].SearchPlanSnapshot[j].ManualSeedIPs = append([]string(nil), runs[i].SearchPlanSnapshot[j].ManualSeedIPs...)
+			cloned[i].SearchPlanSnapshot[j].ManualHintPrefixes = append([]string(nil), runs[i].SearchPlanSnapshot[j].ManualHintPrefixes...)
 		}
 		if runs[i].ConfigSnapshot != nil {
 			snapshot := cloneSettings(*runs[i].ConfigSnapshot)
@@ -1722,6 +1727,8 @@ func cloneRunSearchPlan(searchPlan []RunSearchFamilyPlan) []RunSearchFamilyPlan 
 	cloned := append([]RunSearchFamilyPlan(nil), searchPlan...)
 	for i := range cloned {
 		cloned[i].ManualPrefixes = append([]string(nil), searchPlan[i].ManualPrefixes...)
+		cloned[i].ManualSeedIPs = append([]string(nil), searchPlan[i].ManualSeedIPs...)
+		cloned[i].ManualHintPrefixes = append([]string(nil), searchPlan[i].ManualHintPrefixes...)
 	}
 	return cloned
 }
@@ -2356,7 +2363,7 @@ func (a *App) addSearchMemoryPrefix(w http.ResponseWriter, r *http.Request) {
 		redirectSettingsMessage(w, r, "", err)
 		return
 	}
-	redirectSettingsMessage(w, r, "已加入手动优先网段 "+prefix+"；后续任务会按自适应预算优先探索。", nil)
+	redirectSettingsMessage(w, r, "已加入手动优先范围 "+prefix+"；如果输入含主机地址，系统会保存种子 IP，先精确复测并从对应窄网段深挖。", nil)
 }
 
 func (a *App) deleteSearchMemoryPrefix(w http.ResponseWriter, r *http.Request) {
@@ -2858,12 +2865,14 @@ func (a *App) collectFamilyResults(ctx context.Context, id string, settings Sett
 	profileID := a.ensureSearchProfile(settings, ipVersion)
 	memory := searchmemory.CandidateMemory{}
 	failedPrefixesThisRun := make(map[string]int)
+	var manualSeedIPsPending []string
 	if profileID != "" {
 		if loaded, err := a.searchMemory.Candidates(ctx, profileID, ipVersion, time.Now()); err == nil {
 			memory = loaded
+			manualSeedIPsPending = append([]string(nil), memory.ManualSeedIPs...)
 			a.store.appendRunLog(id, "info", fmt.Sprintf("搜索记忆已加载：可复测的真连接/带宽候选 IP %d 个、实测地区优先网段 %d 个（手动 %d 个）、冷却 IP %d 个、冷却网段 %d 个；本轮预算 精确:%d%% /24或/48:%d%% /16或/32:%d%% 全局:%d%%。", len(memory.SuccessIPs), len(memory.HintPrefixes), len(memory.ManualPrefixes), len(memory.ExcludeIPs), len(memory.ExcludePrefixes), memory.Budget.Exact, memory.Budget.Narrow, memory.Budget.Wide, memory.Budget.Global))
 			if len(memory.ManualPrefixes) > 0 {
-				a.store.appendRunLog(id, "info", fmt.Sprintf("本轮确认使用手动优先父网段：%s；它们按父网段预算优先探索，但不会关闭窄网段和全局候选。", strings.Join(memory.ManualPrefixes, "、")))
+				a.store.appendRunLog(id, "info", fmt.Sprintf("手动优先执行契约：父网段 %s；种子 IP %s；推导范围 %s。先精确复测种子，随后每批至少 40%% 候选来自手动范围；手动范围覆盖自动冷却，但仍须通过地区、RTT、带宽和真连接。", strings.Join(memory.ManualPrefixes, "、"), firstNonEmpty(strings.Join(memory.ManualSeedIPs, "、"), "未保存"), strings.Join(memory.ManualHintPrefixes, "、")))
 			}
 		} else {
 			a.store.appendRunLog(id, "warn", "搜索记忆读取失败，本轮退回无记忆扫描："+err.Error())
@@ -2892,9 +2901,10 @@ func (a *App) collectFamilyResults(ctx context.Context, id string, settings Sett
 
 		resultDeadline := lastResultAt.Add(noResultTimeout)
 		attemptCtx, cancel := context.WithDeadline(ctx, resultDeadline)
-		result, output, err := runBetterIPScan(attemptCtx, settings, ipVersion, historyIPs, hintSubnets, memory.ExcludeIPs, memory.ExcludePrefixes, memory.Budget, func(message string) {
+		result, output, err := runBetterIPScan(attemptCtx, settings, ipVersion, manualSeedIPsPending, memory.ManualHintPrefixes, historyIPs, hintSubnets, memory.ExcludeIPs, memory.ExcludePrefixes, memory.Budget, func(message string) {
 			a.store.appendRunLog(id, "info", message)
 		})
+		manualSeedIPsPending = nil
 		cancel()
 		stageObservations := parseScannerStageObservations(output)
 		learnedHints, stageCounts := a.recordScannerStageObservations(id, profileID, settings, ipVersion, historyIPs, hintSubnets, stageObservations)
@@ -3065,7 +3075,7 @@ func resultMatchesLocation(item IPTestResult, settings Settings) bool {
 	return true
 }
 
-func runBetterIPScan(ctx context.Context, settings Settings, ipVersion int, historyIPs, hintSubnets, excludeIPs, excludeSubnets []string, budget searchmemory.CandidateBudget, onLog func(string)) (IPTestResult, string, error) {
+func runBetterIPScan(ctx context.Context, settings Settings, ipVersion int, manualSeedIPs, manualHintSubnets, historyIPs, hintSubnets, excludeIPs, excludeSubnets []string, budget searchmemory.CandidateBudget, onLog func(string)) (IPTestResult, string, error) {
 	bin, err := findScannerBinary()
 	if err != nil {
 		return IPTestResult{}, "", err
@@ -3092,6 +3102,8 @@ func runBetterIPScan(ctx context.Context, settings Settings, ipVersion int, hist
 		"BETTER_CF_LOCATION_CITY="+strings.TrimSpace(settings.LocationCity),
 		"BETTER_CF_HINT_IPS="+strings.Join(historyIPs, ","),
 		"BETTER_CF_HINT_SUBNETS="+strings.Join(hintSubnets, ","),
+		"BETTER_CF_MANUAL_HINT_IPS="+strings.Join(manualSeedIPs, ","),
+		"BETTER_CF_MANUAL_HINT_SUBNETS="+strings.Join(manualHintSubnets, ","),
 		"BETTER_CF_EXCLUDE_IPS="+strings.Join(excludeIPs, ","),
 		"BETTER_CF_EXCLUDE_SUBNETS="+strings.Join(excludeSubnets, ","),
 		fmt.Sprintf("BETTER_CF_BUDGET_EXACT=%d", budget.Exact),
@@ -3649,6 +3661,11 @@ func (a *App) buildRunSearchPlanSnapshot(ctx context.Context, settings Settings)
 		}
 		plan.Available = true
 		plan.ManualPrefixes = append([]string(nil), memory.ManualPrefixes...)
+		plan.ManualSeedIPs = append([]string(nil), memory.ManualSeedIPs...)
+		plan.ManualHintPrefixes = append([]string(nil), memory.ManualHintPrefixes...)
+		if len(memory.ManualPrefixes) > 0 {
+			plan.ManualQuotaPercent = 40
+		}
 		plan.ExactIPCount = len(memory.SuccessIPs)
 		plan.CoolingIPCount = len(memory.ExcludeIPs)
 		plan.CoolingPrefixCount = len(memory.ExcludePrefixes)
@@ -6083,7 +6100,7 @@ const settingsTemplate = `
 
         <div class="subsection" style="margin-top:16px">
           <div class="row" style="justify-content:space-between; align-items:flex-end">
-            <div><strong>手动优先父网段</strong><div class="muted">IPv4 只接受 <code>/16</code>，IPv6 只接受 <code>/32</code>。输入网段内任意地址后会自动规范化：例如 <code>172.66.130.219/16</code> 会保存并显示为 <code>172.66.0.0/16</code>。</div></div>
+            <div><strong>手动优先种子与父网段</strong><div class="muted">IPv4 只接受 <code>/16</code>，IPv6 只接受 <code>/32</code>。建议输入已知可用 IP，例如 <code>172.66.130.219/16</code>：系统会保留种子 IP，并推导 <code>172.66.130.0/24</code> 与 <code>172.66.0.0/16</code>。</div></div>
             <form method="post" action="/search-memory/prefix/add" class="row">
               <input type="hidden" name="profile_id" value="{{$insight.ID}}">
               <input type="hidden" name="ip_version" value="{{$profile.IPVersion}}">
@@ -6092,10 +6109,10 @@ const settingsTemplate = `
             </form>
           </div>
           <div class="row" style="margin-top:10px">
-            {{range $insight.ManualPrefixes}}
+            {{range $insight.ManualPriorities}}
               <form method="post" action="/search-memory/prefix/delete" class="row">
-                <input type="hidden" name="profile_id" value="{{$insight.ID}}"><input type="hidden" name="prefix" value="{{.}}">
-                <code>{{.}}</code><button type="submit" class="ghost">移除</button>
+				<input type="hidden" name="profile_id" value="{{$insight.ID}}"><input type="hidden" name="prefix" value="{{.Prefix}}">
+				<code>{{.Prefix}}</code>{{if .SeedIP}}<span class="tag">种子 {{.SeedIP}}</span><span class="tag">深挖 {{.NarrowPrefix}}</span>{{end}}<button type="submit" class="ghost">移除</button>
               </form>
             {{else}}<span class="muted">尚未添加手动优先网段。</span>{{end}}
           </div>
@@ -6590,16 +6607,18 @@ const runsTemplate = `
             <div class="metric">
               <span>IPv{{.IPVersion}} 搜索记忆</span>
               {{if .Available}}
-                <strong>{{if .ManualPrefixes}}手动优先：{{range .ManualPrefixes}}<code>{{.}}</code> {{end}}{{else}}未设置手动优先父网段{{end}}</strong>
+				<strong>{{if .ManualPrefixes}}手动优先父网段：{{range .ManualPrefixes}}<code>{{.}}</code> {{end}}{{else}}未设置手动优先父网段{{end}}</strong>
+				{{if .ManualSeedIPs}}<p class="muted">先精确复测种子：{{range .ManualSeedIPs}}<code>{{.}}</code> {{end}}</p>{{end}}
+				{{if .ManualHintPrefixes}}<p class="muted">随后深挖范围：{{range .ManualHintPrefixes}}<code>{{.}}</code> {{end}}</p>{{end}}
                 <p class="muted">可复测 IP {{.ExactIPCount}}；窄网段 {{.NarrowHintCount}}；父网段 {{.WideHintCount}}；冷却 IP {{.CoolingIPCount}} / 网段 {{.CoolingPrefixCount}}</p>
-                <p class="muted">本轮候选预算：精确 {{.Budget.Exact}}% · 窄网段 {{.Budget.Narrow}}% · 父网段 {{.Budget.Wide}}% · 全局 {{.Budget.Global}}%</p>
+				<p class="muted">{{if .ManualQuotaPercent}}手动范围每批保底 {{.ManualQuotaPercent}}%；其余按自适应预算分配：{{end}}精确 {{.Budget.Exact}}% · 窄网段 {{.Budget.Narrow}}% · 父网段 {{.Budget.Wide}}% · 全局 {{.Budget.Global}}%</p>
               {{else}}
                 <strong>本轮没有可读取的搜索记忆</strong>
               {{end}}
             </div>
           {{end}}
         </div>
-        <p class="muted">这里显示的是任务创建时冻结的搜索计划。手动父网段会优先参与候选生成，但仍保留全局探索预算；最终仍须通过 CF-RAY 地区、RTT、带宽和已启用的真连接条件。</p>
+		<p class="muted">这里显示的是任务创建时冻结的搜索计划。手动种子会先精确复测，随后从对应窄网段与父网段持续取样；最终仍须通过 CF-RAY 地区、RTT、带宽和已启用的真连接条件。</p>
       {{end}}
       {{if .ActiveTargets}}
         <strong class="section-title">实际参与本轮 DNS 的目标</strong>

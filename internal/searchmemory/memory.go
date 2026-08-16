@@ -18,7 +18,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 2
+const schemaVersion = 3
 
 type Store struct {
 	db *sql.DB
@@ -75,12 +75,14 @@ type LegacyObservation struct {
 }
 
 type CandidateMemory struct {
-	SuccessIPs      []string
-	HintPrefixes    []string
-	ManualPrefixes  []string
-	ExcludeIPs      []string
-	ExcludePrefixes []string
-	Budget          CandidateBudget
+	SuccessIPs         []string
+	HintPrefixes       []string
+	ManualPrefixes     []string
+	ManualSeedIPs      []string
+	ManualHintPrefixes []string
+	ExcludeIPs         []string
+	ExcludePrefixes    []string
+	Budget             CandidateBudget
 }
 
 type CandidateBudget struct {
@@ -88,6 +90,21 @@ type CandidateBudget struct {
 	Narrow int
 	Wide   int
 	Global int
+}
+
+func appendUnique(values []string, additions ...string) []string {
+	seen := make(map[string]bool, len(values)+len(additions))
+	for _, value := range values {
+		seen[value] = true
+	}
+	for _, value := range additions {
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		values = append(values, value)
+	}
+	return values
 }
 
 type Summary struct {
@@ -164,6 +181,7 @@ func (s *Store) migrate(ctx context.Context) error {
 		`CREATE TABLE IF NOT EXISTS manual_prefixes (
 			profile_id TEXT NOT NULL,
 			prefix TEXT NOT NULL,
+			seed_ip TEXT NOT NULL DEFAULT '',
 			created_at TEXT NOT NULL,
 			PRIMARY KEY(profile_id, prefix)
 		)`,
@@ -191,6 +209,15 @@ func (s *Store) migrate(ctx context.Context) error {
 	}
 	if version == 1 {
 		if err := s.addColumnIfMissing(ctx, "ip_observations", "candidate_source", `ALTER TABLE ip_observations ADD COLUMN candidate_source TEXT NOT NULL DEFAULT 'global'`); err != nil {
+			return err
+		}
+		if _, err := s.db.ExecContext(ctx, `UPDATE schema_meta SET version=2`); err != nil {
+			return err
+		}
+		version = 2
+	}
+	if version == 2 {
+		if err := s.addColumnIfMissing(ctx, "manual_prefixes", "seed_ip", `ALTER TABLE manual_prefixes ADD COLUMN seed_ip TEXT NOT NULL DEFAULT ''`); err != nil {
 			return err
 		}
 		if _, err := s.db.ExecContext(ctx, `UPDATE schema_meta SET version=?`, schemaVersion); err != nil {
@@ -345,18 +372,29 @@ func (s *Store) ImportLegacy(ctx context.Context, items []LegacyObservation) err
 func (s *Store) Candidates(ctx context.Context, profileID string, version int, now time.Time) (CandidateMemory, error) {
 	var memory CandidateMemory
 	memory.Budget = CandidateBudget{Exact: 15, Narrow: 30, Wide: 20, Global: 35}
-	manualRows, err := s.db.QueryContext(ctx, `SELECT prefix FROM manual_prefixes WHERE profile_id=? ORDER BY created_at DESC`, profileID)
+	manualRows, err := s.db.QueryContext(ctx, `SELECT prefix,seed_ip FROM manual_prefixes WHERE profile_id=? ORDER BY created_at DESC`, profileID)
 	if err != nil {
 		return memory, err
 	}
 	for manualRows.Next() {
-		var prefix string
-		if manualRows.Scan(&prefix) == nil {
+		var prefix, seedIP string
+		if manualRows.Scan(&prefix, &seedIP) == nil {
 			memory.ManualPrefixes = append(memory.ManualPrefixes, prefix)
+			if addr, parseErr := netip.ParseAddr(seedIP); parseErr == nil && (version == 4) == addr.Is4() {
+				seedIP = addr.String()
+				memory.ManualSeedIPs = appendUnique(memory.ManualSeedIPs, seedIP)
+				narrowBits := 48
+				if version == 4 {
+					narrowBits = 24
+				}
+				memory.ManualHintPrefixes = appendUnique(memory.ManualHintPrefixes, netip.PrefixFrom(addr, narrowBits).Masked().String())
+			}
+			memory.ManualHintPrefixes = appendUnique(memory.ManualHintPrefixes, prefix)
 			memory.HintPrefixes = append(memory.HintPrefixes, prefix)
 		}
 	}
 	manualRows.Close()
+	memory.HintPrefixes = appendUnique(memory.ManualHintPrefixes, memory.HintPrefixes...)
 	sevenDays := now.Add(-7 * 24 * time.Hour).UTC().Format(time.RFC3339Nano)
 	threeDays := now.Add(-3 * 24 * time.Hour).UTC().Format(time.RFC3339Nano)
 	oneDay := now.Add(-24 * time.Hour).UTC().Format(time.RFC3339Nano)

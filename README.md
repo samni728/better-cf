@@ -1,12 +1,12 @@
 # Better CF
 
-[![Version](https://img.shields.io/badge/version-v1.2.1-2563eb)](VERSION)
+[![Version](https://img.shields.io/badge/version-v1.3.0-2563eb)](VERSION)
 [![GitHub](https://img.shields.io/badge/GitHub-samni728%2Fbetter--cf-111827?logo=github)](https://github.com/samni728/better-cf)
 [![Star](https://img.shields.io/github/stars/samni728/better-cf?style=social)](https://github.com/samni728/better-cf)
 
 Better CF 是一个基于 `better-cloudflare-ip` 的 Cloudflare 优选 IP 自动化项目。
 
-当前 `v1.2.1` 已把 WebUI 拆成执行中心、任务历史、IP 结果和项目配置四个工作区，并新增分阶段 SQLite 搜寻记忆。系统会分别记录实际机房命中、带宽达标/未达标和真连接结果；任务计划会冻结并显示手动优先父网段、历史候选层级、冷却数量与自适应预算，确保实际执行范围可核对。
+当前 `v1.3.0` 已把 WebUI 拆成执行中心、任务历史、IP 结果和项目配置四个工作区，并新增分阶段 SQLite 搜寻记忆。手动优先范围会保留用户输入的种子 IP，先精确复测，再从对应窄网段和父网段深挖；每批至少 40% 候选来自手动范围，任务计划与日志会完整展示实际执行范围。
 
 它的目标是：在当前 VPS / 本地网络环境中定期扫描速度更好的 Cloudflare IPv4 / IPv6 IP，保存测速结果，再把最终选出的 IP 批量同步到你自己的 Cloudflare 域名解析中。这样客户端只需要使用你的自定义优选域名，就能使用最新一轮筛选出来的 Cloudflare 优选 IP。
 

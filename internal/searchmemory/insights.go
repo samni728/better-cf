@@ -38,6 +38,12 @@ type HTTPOnlyInsight struct {
 	LastSeenAt    string
 }
 
+type ManualPriorityInsight struct {
+	Prefix       string
+	SeedIP       string
+	NarrowPrefix string
+}
+
 type ProfileInsight struct {
 	ID                 string
 	Profile            Profile
@@ -50,6 +56,7 @@ type ProfileInsight struct {
 	SuccessfulPrefixes []PrefixInsight
 	CoolingPrefixes    []string
 	ManualPrefixes     []string
+	ManualPriorities   []ManualPriorityInsight
 	Budget             CandidateBudget
 	Ports              []PortInsight
 	HTTPOnlyPrefixes   []HTTPOnlyInsight
@@ -121,6 +128,10 @@ func (s *Store) AddManualPrefix(ctx context.Context, profileID string, version i
 	if prefix.Bits() != wantBits {
 		return "", fmt.Errorf("IPv%d 手动优先网段必须使用 /%d", version, wantBits)
 	}
+	seedIP := ""
+	if addr := prefix.Addr(); addr != prefix.Masked().Addr() {
+		seedIP = addr.String()
+	}
 	prefix = prefix.Masked()
 	var rawProfile string
 	if err := s.db.QueryRowContext(ctx, `SELECT config_json FROM search_profiles WHERE id=?`, profileID).Scan(&rawProfile); errors.Is(err, sql.ErrNoRows) {
@@ -132,8 +143,8 @@ func (s *Store) AddManualPrefix(ctx context.Context, profileID string, version i
 	if err := json.Unmarshal([]byte(rawProfile), &profile); err != nil || profile.IPVersion != version {
 		return "", errors.New("搜索记忆配置档案与 IP 版本不匹配")
 	}
-	_, err = s.db.ExecContext(ctx, `INSERT INTO manual_prefixes(profile_id,prefix,created_at) VALUES(?,?,?)
-		ON CONFLICT(profile_id,prefix) DO NOTHING`, profileID, prefix.String(), time.Now().UTC().Format(time.RFC3339Nano))
+	_, err = s.db.ExecContext(ctx, `INSERT INTO manual_prefixes(profile_id,prefix,seed_ip,created_at) VALUES(?,?,?,?)
+		ON CONFLICT(profile_id,prefix) DO UPDATE SET seed_ip=CASE WHEN excluded.seed_ip<>'' THEN excluded.seed_ip ELSE manual_prefixes.seed_ip END, created_at=excluded.created_at`, profileID, prefix.String(), seedIP, time.Now().UTC().Format(time.RFC3339Nano))
 	return prefix.String(), err
 }
 
@@ -225,6 +236,23 @@ func (s *Store) ProfileInsight(ctx context.Context, profileID string, profile Pr
 	}
 	result.CoolingPrefixes = memory.ExcludePrefixes
 	result.ManualPrefixes = memory.ManualPrefixes
+	for _, prefix := range memory.ManualPrefixes {
+		item := ManualPriorityInsight{Prefix: prefix}
+		for _, seed := range memory.ManualSeedIPs {
+			addr, addrErr := netip.ParseAddr(seed)
+			parent, prefixErr := netip.ParsePrefix(prefix)
+			if addrErr == nil && prefixErr == nil && parent.Contains(addr) {
+				item.SeedIP = seed
+				bits := 48
+				if addr.Is4() {
+					bits = 24
+				}
+				item.NarrowPrefix = netip.PrefixFrom(addr, bits).Masked().String()
+				break
+			}
+		}
+		result.ManualPriorities = append(result.ManualPriorities, item)
+	}
 	result.Ports, err = s.portInsights(ctx, profileID, cutoff)
 	if err != nil {
 		return result, err

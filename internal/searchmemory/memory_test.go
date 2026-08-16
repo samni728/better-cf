@@ -161,12 +161,46 @@ func TestSchemaVersionOneMigratesCandidateSource(t *testing.T) {
 	}
 	defer store.Close()
 	var version int
-	if err := store.db.QueryRow(`SELECT version FROM schema_meta`).Scan(&version); err != nil || version != 2 {
+	if err := store.db.QueryRow(`SELECT version FROM schema_meta`).Scan(&version); err != nil || version != 3 {
 		t.Fatalf("schema version = %d, err=%v", version, err)
 	}
 	var columnCount int
 	if err := store.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('ip_observations') WHERE name='candidate_source'`).Scan(&columnCount); err != nil || columnCount != 1 {
 		t.Fatalf("candidate_source columns = %d, err=%v", columnCount, err)
+	}
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('manual_prefixes') WHERE name='seed_ip'`).Scan(&columnCount); err != nil || columnCount != 1 {
+		t.Fatalf("seed_ip columns = %d, err=%v", columnCount, err)
+	}
+}
+
+func TestSchemaVersionTwoMigratesManualSeedIP(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "v2.sqlite")
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	statements := []string{
+		`CREATE TABLE schema_meta(version INTEGER NOT NULL)`,
+		`INSERT INTO schema_meta(version) VALUES(2)`,
+		`CREATE TABLE manual_prefixes(profile_id TEXT NOT NULL,prefix TEXT NOT NULL,created_at TEXT NOT NULL,PRIMARY KEY(profile_id,prefix))`,
+	}
+	for _, statement := range statements {
+		if _, err := db.Exec(statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = db.Close()
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	var version, columnCount int
+	if err := store.db.QueryRow(`SELECT version FROM schema_meta`).Scan(&version); err != nil || version != 3 {
+		t.Fatalf("schema version = %d, err=%v", version, err)
+	}
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('manual_prefixes') WHERE name='seed_ip'`).Scan(&columnCount); err != nil || columnCount != 1 {
+		t.Fatalf("seed_ip columns = %d, err=%v", columnCount, err)
 	}
 }
 
@@ -206,6 +240,16 @@ func TestManualPrefixBudgetAndHTTPOnlyInsights(t *testing.T) {
 	}
 	if !slices.Contains(insight.ManualPrefixes, "172.66.0.0/16") {
 		t.Fatalf("manual prefixes = %v", insight.ManualPrefixes)
+	}
+	memory, err := store.Candidates(ctx, profileID, 4, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(memory.ManualSeedIPs, "172.66.9.1") || !slices.Contains(memory.ManualHintPrefixes, "172.66.9.0/24") || !slices.Contains(memory.ManualHintPrefixes, "172.66.0.0/16") {
+		t.Fatalf("manual seed/hints = seeds:%v hints:%v", memory.ManualSeedIPs, memory.ManualHintPrefixes)
+	}
+	if len(insight.ManualPriorities) != 1 || insight.ManualPriorities[0].SeedIP != "172.66.9.1" || insight.ManualPriorities[0].NarrowPrefix != "172.66.9.0/24" {
+		t.Fatalf("manual priority insight = %+v", insight.ManualPriorities)
 	}
 	if insight.Budget.Narrow <= insight.Budget.Global {
 		t.Fatalf("expected successful narrow source to outrank failed global source: %+v", insight.Budget)

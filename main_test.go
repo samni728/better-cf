@@ -150,7 +150,7 @@ func TestExtendHintSubnetsLearnsFromMatchingRTTResults(t *testing.T) {
 func TestHierarchicalCandidatesUseHintsAndRespectCooldown(t *testing.T) {
 	sampler := newSubnetSampler([]string{"104.16.0.0/24", "104.17.0.0/24"})
 	excluded := []netip.Prefix{netip.MustParsePrefix("172.66.130.0/24")}
-	got := hierarchicalCandidateIPs(sampler, []string{"172.66.130.0/24", "172.66.0.0/16"}, map[string]bool{"104.16.0.1": true}, excluded, 40, 4, candidateBudget{Exact: 15, Narrow: 30, Wide: 20, Global: 35})
+	got := hierarchicalCandidateIPs(sampler, nil, []string{"172.66.130.0/24", "172.66.0.0/16"}, map[string]bool{"104.16.0.1": true}, excluded, 40, 4, candidateBudget{Exact: 15, Narrow: 30, Wide: 20, Global: 35})
 	if len(got) != 40 {
 		t.Fatalf("hierarchicalCandidateIPs returned %d candidates, want 40", len(got))
 	}
@@ -194,7 +194,7 @@ func TestCandidateBudgetFromEnv(t *testing.T) {
 
 func TestHierarchicalCandidatesFollowAdaptiveBudget(t *testing.T) {
 	sampler := newSubnetSampler([]string{"198.51.100.0/24"})
-	got := hierarchicalCandidateIPs(sampler, []string{"172.66.130.0/24", "104.18.0.0/16"}, nil, nil, 100, 4, candidateBudget{Narrow: 40, Wide: 30, Global: 30})
+	got := hierarchicalCandidateIPs(sampler, nil, []string{"172.66.130.0/24", "104.18.0.0/16"}, nil, nil, 100, 4, candidateBudget{Narrow: 40, Wide: 30, Global: 30})
 	narrow, wide, global := 0, 0, 0
 	narrowPrefix := netip.MustParsePrefix("172.66.130.0/24")
 	widePrefix := netip.MustParsePrefix("104.18.0.0/16")
@@ -211,5 +211,29 @@ func TestHierarchicalCandidatesFollowAdaptiveBudget(t *testing.T) {
 	}
 	if narrow < 38 || wide < 28 || global < 28 {
 		t.Fatalf("adaptive allocation narrow=%d wide=%d global=%d", narrow, wide, global)
+	}
+}
+
+func TestManualPriorityReservesCandidatesAndOverridesCooldown(t *testing.T) {
+	sampler := newSubnetSampler([]string{"198.51.100.0/24"})
+	manual := []string{"172.66.130.0/24", "172.66.0.0/16"}
+	cooled := []netip.Prefix{netip.MustParsePrefix("172.66.130.0/24")}
+	got := hierarchicalCandidateIPs(sampler, manual, nil, nil, cooled, 100, 4, candidateBudget{Narrow: 30, Wide: 20, Global: 50})
+	if len(got) != 100 {
+		t.Fatalf("manual candidates returned %d, want 100", len(got))
+	}
+	if count := countIPsInPrefixes(got, manual); count < 40 {
+		t.Fatalf("manual priority count = %d, want at least 40", count)
+	}
+	narrow := netip.MustParsePrefix("172.66.130.0/24")
+	foundCooledManual := false
+	for _, raw := range got {
+		if narrow.Contains(netip.MustParseAddr(raw)) {
+			foundCooledManual = true
+			break
+		}
+	}
+	if !foundCooledManual {
+		t.Fatal("manual priority should override automatic cooldown")
 	}
 }

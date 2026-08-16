@@ -171,6 +171,9 @@ func TestRunPlanFreezesManualPriorityPrefixAndCandidateBudget(t *testing.T) {
 	if len(searchPlan) != 1 || !searchPlan[0].Available || !reflect.DeepEqual(searchPlan[0].ManualPrefixes, []string{"172.66.0.0/16"}) {
 		t.Fatalf("search plan = %+v", searchPlan)
 	}
+	if !reflect.DeepEqual(searchPlan[0].ManualSeedIPs, []string{"172.66.130.219"}) || !reflect.DeepEqual(searchPlan[0].ManualHintPrefixes, []string{"172.66.130.0/24", "172.66.0.0/16"}) || searchPlan[0].ManualQuotaPercent != 40 {
+		t.Fatalf("manual execution contract = %+v", searchPlan[0])
+	}
 	if searchPlan[0].WideHintCount != 1 || searchPlan[0].Budget.Global == 0 {
 		t.Fatalf("search plan counts/budget = %+v", searchPlan[0])
 	}
@@ -294,7 +297,7 @@ func TestScannerStageObservationsAreParsedAndHiddenFromUserLog(t *testing.T) {
 }
 
 func TestVersionAndRepositoryAreExposed(t *testing.T) {
-	if appVersion != "v1.2.1" || repositoryURL != "https://github.com/samni728/better-cf" {
+	if appVersion != "v1.3.0" || repositoryURL != "https://github.com/samni728/better-cf" {
 		t.Fatalf("version metadata = %s / %s", appVersion, repositoryURL)
 	}
 	if defaultSettings().SearchNetworkLabel != "213 VPS" {

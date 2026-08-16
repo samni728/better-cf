@@ -188,6 +188,11 @@ func cloudflareTest(ipType int, useTLS bool, taskNum int, speed int, maxRTTMs in
 		fmt.Printf("已从历史地区命中、带宽及真连接结果提取 %d 个 IPv%d 优先网段，每轮会先按父网段广泛探索，再从命中的窄网段深挖。\n", len(hintSubnets), ipType)
 	}
 	historyIPs := hintIPsFromEnv(ipType)
+	manualSeedIPs := ipListFromEnv("BETTER_CF_MANUAL_HINT_IPS", ipType, 50)
+	manualHintSubnets := subnetListFromEnv("BETTER_CF_MANUAL_HINT_SUBNETS", ipType)
+	if len(manualSeedIPs) > 0 || len(manualHintSubnets) > 0 {
+		fmt.Printf("手动优先执行契约已加载：种子 IP %d 个、种子窄网段/父网段 %d 个；先精确复测种子，每批候选至少 40%% 来自手动范围。\n", len(manualSeedIPs), len(manualHintSubnets))
+	}
 	budget := candidateBudgetFromEnv()
 	excludeIPs := ipSetFromEnv("BETTER_CF_EXCLUDE_IPS", ipType)
 	excludePrefixes := prefixListFromEnv("BETTER_CF_EXCLUDE_SUBNETS", ipType)
@@ -213,6 +218,7 @@ func cloudflareTest(ipType int, useTLS bool, taskNum int, speed int, maxRTTMs in
 	filterStartedAt := time.Now()
 	fallbackLogged := false
 	historyPending := len(historyIPs) > 0
+	manualPending := len(manualSeedIPs) > 0
 	for {
 		activeFilter := filter.Active(time.Since(filterStartedAt))
 		if filter.Enabled() && !activeFilter.Enabled() && !fallbackLogged {
@@ -222,13 +228,18 @@ func cloudflareTest(ipType int, useTLS bool, taskNum int, speed int, maxRTTMs in
 		var rttResults []RTTResult
 		for {
 			var testIPs []string
-			if historyPending {
+			if manualPending {
+				manualPending = false
+				testIPs = append([]string(nil), manualSeedIPs...)
+				fmt.Printf("正在精确复测 %d 个手动种子 IP：%s\n", len(testIPs), strings.Join(testIPs, "、"))
+			} else if historyPending {
 				historyPending = false
 				testIPs = append([]string(nil), historyIPs...)
 				fmt.Printf("正在优先复测 %d 个历史成功 IP...\n", len(testIPs))
 			} else {
-				testIPs = hierarchicalCandidateIPs(subnetSampler, hintSubnets, excludeIPs, excludePrefixes, sampleSize, ipType, budget)
-				fmt.Printf("已从原版地址池生成 %d 个候选 IP，先进行快速响应和机房检测...\n", len(testIPs))
+				testIPs = hierarchicalCandidateIPs(subnetSampler, manualHintSubnets, hintSubnets, excludeIPs, excludePrefixes, sampleSize, ipType, budget)
+				manualCount := countIPsInPrefixes(testIPs, manualHintSubnets)
+				fmt.Printf("已生成 %d 个候选 IP（手动优先范围 %d 个、历史与全局 %d 个），先进行快速响应和机房检测...\n", len(testIPs), manualCount, len(testIPs)-manualCount)
 			}
 
 			rttResults = runRTTTest(testIPs, taskNum, useTLS, maxRTTMs, activeFilter)
@@ -464,9 +475,9 @@ func candidateSubnets(sampler *subnetSampler, hints []string, sampleSize int) []
 	return result
 }
 
-// hierarchicalCandidateIPs 将一半预算用于成功网段的利用/父网段探索，另一半用于全局新网段。
+// hierarchicalCandidateIPs 先为用户手动范围保留 40% 候选，再按自适应预算分配历史窄网段、父网段和全局探索。
 // IPv4 hint 可同时包含 /24 和 /16；同一 /16 会随机落到不同 /24，找到成功后再由 /24 深挖。
-func hierarchicalCandidateIPs(sampler *subnetSampler, hints []string, excludeIPs map[string]bool, excludePrefixes []netip.Prefix, sampleSize, ipType int, budget candidateBudget) []string {
+func hierarchicalCandidateIPs(sampler *subnetSampler, manualHints, hints []string, excludeIPs map[string]bool, excludePrefixes []netip.Prefix, sampleSize, ipType int, budget candidateBudget) []string {
 	if sampleSize <= 0 {
 		return nil
 	}
@@ -488,13 +499,34 @@ func hierarchicalCandidateIPs(sampler *subnetSampler, hints []string, excludeIPs
 		seen[ip] = true
 		result = append(result, ip)
 	}
+	addManual := func(ip string) {
+		if ip == "" || seen[ip] {
+			return
+		}
+		if _, err := netip.ParseAddr(ip); err != nil {
+			return
+		}
+		seen[ip] = true
+		result = append(result, ip)
+	}
 
+	manualTarget := 0
+	if len(manualHints) > 0 {
+		manualTarget = maxInt(1, sampleSize*40/100)
+	}
+	activeManual := randomSample(manualHints, minInt(len(manualHints), 20))
+	for attempts := 0; len(result) < manualTarget && len(activeManual) > 0 && attempts < maxInt(1, manualTarget*40); attempts++ {
+		// 用户明确加入的优先范围覆盖自动冷却，否则近期失败记忆会让“手动优先”看似配置成功却完全不执行。
+		addManual(randomIPFromPrefix(activeManual[attempts%len(activeManual)], ipType))
+	}
+	manualGenerated := len(result)
+	remainingSize := sampleSize - manualGenerated
 	generatedBudget := budget.Narrow + budget.Wide + budget.Global
 	if generatedBudget <= 0 {
 		generatedBudget = 1
 	}
-	narrowTarget := sampleSize * budget.Narrow / generatedBudget
-	wideTarget := narrowTarget + sampleSize*budget.Wide/generatedBudget
+	narrowTarget := manualGenerated + remainingSize*budget.Narrow/generatedBudget
+	wideTarget := narrowTarget + remainingSize*budget.Wide/generatedBudget
 	var narrowHints, wideHints []string
 	for _, raw := range hints {
 		prefix, err := netip.ParsePrefix(strings.TrimSpace(raw))
@@ -534,6 +566,29 @@ func hierarchicalCandidateIPs(sampler *subnetSampler, hints []string, excludeIPs
 		add(randomIPFromPrefix(batch[0], ipType))
 	}
 	return result
+}
+
+func countIPsInPrefixes(values, rawPrefixes []string) int {
+	prefixes := make([]netip.Prefix, 0, len(rawPrefixes))
+	for _, raw := range rawPrefixes {
+		if prefix, err := netip.ParsePrefix(strings.TrimSpace(raw)); err == nil {
+			prefixes = append(prefixes, prefix.Masked())
+		}
+	}
+	count := 0
+	for _, value := range values {
+		addr, err := netip.ParseAddr(value)
+		if err != nil {
+			continue
+		}
+		for _, prefix := range prefixes {
+			if prefix.Contains(addr) {
+				count++
+				break
+			}
+		}
+	}
+	return count
 }
 
 func randomIPFromPrefix(raw string, ipType int) string {
@@ -637,7 +692,11 @@ func filterCandidateIPs(values []string, excludes map[string]bool, prefixes []ne
 }
 
 func hintSubnetsFromEnv(ipType int) []string {
-	raw := strings.TrimSpace(os.Getenv("BETTER_CF_HINT_SUBNETS"))
+	return subnetListFromEnv("BETTER_CF_HINT_SUBNETS", ipType)
+}
+
+func subnetListFromEnv(name string, ipType int) []string {
+	raw := strings.TrimSpace(os.Getenv(name))
 	if raw == "" {
 		return nil
 	}
@@ -662,7 +721,11 @@ func hintSubnetsFromEnv(ipType int) []string {
 }
 
 func hintIPsFromEnv(ipType int) []string {
-	raw := strings.TrimSpace(os.Getenv("BETTER_CF_HINT_IPS"))
+	return ipListFromEnv("BETTER_CF_HINT_IPS", ipType, 100)
+}
+
+func ipListFromEnv(name string, ipType, limit int) []string {
+	raw := strings.TrimSpace(os.Getenv(name))
 	if raw == "" {
 		return nil
 	}
@@ -682,7 +745,7 @@ func hintIPsFromEnv(ipType int) []string {
 		}
 		seen[value] = true
 		result = append(result, value)
-		if len(result) >= 100 {
+		if len(result) >= limit {
 			break
 		}
 	}
