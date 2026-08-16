@@ -45,7 +45,7 @@ type App struct {
 }
 
 const (
-	appVersion    = "v1.1.0"
+	appVersion    = "v1.1.1"
 	repositoryURL = "https://github.com/samni728/better-cf"
 )
 
@@ -179,6 +179,25 @@ type RunRecord struct {
 	FinishedAt              string                `json:"finished_at,omitempty"`
 	Summary                 string                `json:"summary,omitempty"`
 	Logs                    []RunLog              `json:"logs"`
+	Plan                    RunPlanView           `json:"-"`
+}
+
+type RunPlanTargetView struct {
+	Name        string
+	RecordName  string
+	RecordsText string
+	Reason      string
+}
+
+type RunPlanView struct {
+	Available          bool
+	ScanText           string
+	TrueConnectionText string
+	DNSHeadline        string
+	IPv4RecordCount    int
+	IPv6RecordCount    int
+	ActiveTargets      []RunPlanTargetView
+	SkippedTargets     []RunPlanTargetView
 }
 
 type GeoFilterStats struct {
@@ -1461,7 +1480,91 @@ func requiredDNSRecordCount(settings Settings) int {
 
 func dnsTargetSummary(settings Settings) string {
 	ipv4Targets, ipv6Targets := dnsBindingCounts(settings)
-	return fmt.Sprintf("%d 个已启用目标（A：%d，AAAA：%d），计划确认 %d 条 DNS 记录", enabledDNSTargetCount(settings), ipv4Targets, ipv6Targets, requiredDNSRecordCount(settings))
+	return fmt.Sprintf("全部配置：%d 个已启用目标（支持 A：%d，支持 AAAA：%d）", enabledDNSTargetCount(settings), ipv4Targets, ipv6Targets)
+}
+
+func runDNSPlanCounts(settings Settings) (ipv4Records, ipv6Records int) {
+	ipv4Targets, ipv6Targets := dnsBindingCounts(settings)
+	return activeIPv4Count(settings) * ipv4Targets, activeIPv6Count(settings) * ipv6Targets
+}
+
+func runDNSPlanSummary(settings Settings) string {
+	ipv4Records, ipv6Records := runDNSPlanCounts(settings)
+	return fmt.Sprintf("本轮 DNS：%d 个域名目标，%d 条 A，%d 条 AAAA", plannedDNSTargetCount(settings), ipv4Records, ipv6Records)
+}
+
+func buildRunPlan(settings Settings) RunPlanView {
+	plan := RunPlanView{Available: true}
+	ipv4Count := activeIPv4Count(settings)
+	ipv6Count := activeIPv6Count(settings)
+	if ipv4Count > 0 {
+		plan.ScanText = fmt.Sprintf("IPv4：%d 个", ipv4Count)
+	} else {
+		plan.ScanText = "IPv4：不执行"
+	}
+	if ipv6Count > 0 {
+		plan.ScanText += fmt.Sprintf("；IPv6：%d 个", ipv6Count)
+	} else {
+		plan.ScanText += "；IPv6：不执行"
+	}
+
+	plan.TrueConnectionText = trueConnectionPlanText(settings)
+	plan.IPv4RecordCount, plan.IPv6RecordCount = runDNSPlanCounts(settings)
+	plan.DNSHeadline = fmt.Sprintf("%d 个域名目标；%d 条 A；%d 条 AAAA", plannedDNSTargetCount(settings), plan.IPv4RecordCount, plan.IPv6RecordCount)
+	for _, target := range settings.DNSTargets {
+		if !target.Enabled {
+			continue
+		}
+		var records, skipped []string
+		if targetSupportsFamily(target, 4) {
+			if ipv4Count > 0 {
+				records = append(records, fmt.Sprintf("%d 条 A", ipv4Count))
+			} else {
+				skipped = append(skipped, "IPv4 未启用，不写 A")
+			}
+		}
+		if targetSupportsFamily(target, 6) {
+			if ipv6Count > 0 {
+				records = append(records, fmt.Sprintf("%d 条 AAAA", ipv6Count))
+			} else {
+				skipped = append(skipped, "IPv6 未启用，不写 AAAA")
+			}
+		}
+		item := RunPlanTargetView{Name: target.Name, RecordName: target.RecordName}
+		if len(records) > 0 {
+			item.RecordsText = strings.Join(append(records, skipped...), "；")
+			plan.ActiveTargets = append(plan.ActiveTargets, item)
+		} else {
+			item.Reason = strings.Join(skipped, "；")
+			plan.SkippedTargets = append(plan.SkippedTargets, item)
+		}
+	}
+	return plan
+}
+
+func trueConnectionPlanText(settings Settings) string {
+	var families []string
+	if settings.TrueConnectionIPv4 {
+		families = append(families, "IPv4")
+	}
+	if settings.TrueConnectionIPv6 {
+		families = append(families, "IPv6")
+	}
+	if len(families) == 0 {
+		return "关闭；入选只依据 Cloudflare 响应、RTT 与带宽"
+	}
+	var protocols []string
+	if settings.TrueConnectionHTTP {
+		protocols = append(protocols, "HTTP（7 个端口）")
+	}
+	if settings.TrueConnectionHTTPS {
+		protocols = append(protocols, "HTTPS（6 个端口）")
+	}
+	familyText := strings.Join(families, " + ")
+	if len(families) == 1 {
+		familyText = "仅 " + familyText
+	}
+	return familyText + "；" + strings.Join(protocols, " + ")
 }
 
 func (s *Store) saveLocked() error {
@@ -2416,6 +2519,7 @@ func (a *App) runDetailPage(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimSpace(r.URL.Query().Get("id"))
 	for _, run := range state.Runs {
 		if run.ID == id {
+			decorateRunPlan(&run)
 			data.RecentRuns = []RunRecord{run}
 			break
 		}
@@ -4685,16 +4789,22 @@ func nextTimeAt(now time.Time, hhmm string) time.Time {
 }
 
 func recentRuns(runs []RunRecord, limit int) []RunRecord {
-	if len(runs) <= limit {
-		return runs
+	if len(runs) < limit {
+		limit = len(runs)
 	}
-	return runs[:limit]
+	views := append([]RunRecord(nil), runs[:limit]...)
+	for i := range views {
+		decorateRunPlan(&views[i])
+	}
+	return views
 }
 
 func currentRun(runs []RunRecord) *RunRecord {
 	for i := range runs {
 		if runs[i].Status == "running" {
-			return &runs[i]
+			view := runs[i]
+			decorateRunPlan(&view)
+			return &view
 		}
 	}
 	return nil
@@ -4704,7 +4814,16 @@ func latestRun(runs []RunRecord) *RunRecord {
 	if len(runs) == 0 {
 		return nil
 	}
-	return &runs[0]
+	view := runs[0]
+	decorateRunPlan(&view)
+	return &view
+}
+
+func decorateRunPlan(run *RunRecord) {
+	if run == nil || run.ConfigSnapshot == nil {
+		return
+	}
+	run.Plan = buildRunPlan(*run.ConfigSnapshot)
 }
 
 func hasRunningRun(runs []RunRecord) bool {
@@ -5064,11 +5183,11 @@ func dnsStatusText(status string) string {
 }
 
 func runSummary(trigger string, settings Settings, geoStats GeoFilterStats) string {
-	return fmt.Sprintf("%s / IPv4:%d IPv6:%d / %s / %s / %d Mbps / RTT并发:%d / 最大RTT:%dms / %s",
+	return fmt.Sprintf("%s / 本轮扫描 IPv4:%d IPv6:%d / %s / %s / %d Mbps / RTT并发:%d / 最大RTT:%dms / %s",
 		triggerLabel(trigger),
 		activeIPv4Count(settings),
 		activeIPv6Count(settings),
-		dnsTargetSummary(settings),
+		runDNSPlanSummary(settings),
 		locationFilterSummaryWithStats(settings, geoStats),
 		settings.BandwidthMbps,
 		settings.RTTConcurrency,
@@ -5202,6 +5321,10 @@ const layoutTemplate = `
     .metric { border: 1px solid #e5e7eb; border-radius: 8px; padding: 14px; background: #fbfdff; }
     .metric span { display: block; color: #6b7280; font-size: 13px; }
     .metric strong { display: block; margin-top: 6px; font-size: 18px; overflow-wrap: anywhere; }
+    .run-plan { border: 1px solid #bfdbfe; border-radius: 10px; padding: 16px; margin: 12px 0; background: #eff6ff; }
+    .run-plan h3 { margin: 0 0 12px; font-size: 17px; }
+    .run-plan .compact-list { margin-top: 10px; }
+    .run-plan .skipped { color: #6b7280; }
     .subsection { border-top: 1px solid #e5e7eb; padding-top: 16px; }
     .config-card-list { display: grid; gap: 12px; margin-top: 12px; }
     .config-card { border: 1px solid #dbe3ee; border-radius: 10px; padding: 16px; background: #fbfdff; }
@@ -5343,7 +5466,7 @@ const dashboardTemplate = `
 
 <section class="kpi-grid">
   <div class="kpi"><span>今日更新 IP</span><strong>{{.Stats.TodayUpdatedIPs}}</strong></div>
-  <div class="kpi"><span>今日确认 DNS 记录</span><strong>{{.Stats.TodaySyncedIPs}}</strong></div>
+  <div class="kpi"><span>今日已由 Cloudflare 核验的记录</span><strong>{{.Stats.TodaySyncedIPs}}</strong></div>
   <div class="kpi"><span>今日任务</span><strong>{{.Stats.TodayTaskCount}}</strong></div>
   <div class="kpi"><span>DNS 状态</span><strong>{{.Stats.LastDNSStatus}}</strong></div>
 </section>
@@ -5355,18 +5478,20 @@ const dashboardTemplate = `
       <p class="muted">当前阶段：{{.CurrentRun.Stage}}</p>
       <div class="progress"><div style="width: {{.CurrentRun.Progress}}%"></div></div>
       <div class="grid">
-        <div class="metric"><span>已发现可用 IP</span><strong>{{.CurrentRun.UpdatedIPCount}} / {{.CurrentRun.RequiredIPCount}}</strong></div>
-        <div class="metric"><span>已确认 DNS 记录</span><strong>{{.CurrentRun.SyncedIPCount}} / {{if .CurrentRun.RequiredDNSRecordCount}}{{.CurrentRun.RequiredDNSRecordCount}}{{else}}{{.CurrentRun.RequiredIPCount}}{{end}}</strong></div>
+        <div class="metric"><span>通过全部筛选的 IP</span><strong>{{.CurrentRun.UpdatedIPCount}} / {{.CurrentRun.RequiredIPCount}}</strong></div>
+        <div class="metric"><span>Cloudflare 已核验记录（逐条）</span><strong>{{.CurrentRun.SyncedIPCount}} / {{if .CurrentRun.RequiredDNSRecordCount}}{{.CurrentRun.RequiredDNSRecordCount}}{{else}}{{.CurrentRun.RequiredIPCount}}{{end}}</strong></div>
         <div class="metric"><span>触发方式</span><strong>{{if eq .CurrentRun.Trigger "scheduled"}}定时{{else if eq .CurrentRun.Trigger "resume"}}续接{{else}}手动{{end}}</strong></div>
       </div>
+      {{template "runPlan" .CurrentRun.Plan}}
     {{else if .LatestRun}}
       <p class="muted">最近一次：{{.LatestRun.Stage}}</p>
       <div class="progress"><div style="width: {{.LatestRun.Progress}}%"></div></div>
       <div class="grid">
-        <div class="metric"><span>更新 IP</span><strong>{{.LatestRun.UpdatedIPCount}} / {{.LatestRun.RequiredIPCount}}</strong></div>
-        <div class="metric"><span>确认 DNS 记录</span><strong>{{.LatestRun.SyncedIPCount}} / {{if .LatestRun.RequiredDNSRecordCount}}{{.LatestRun.RequiredDNSRecordCount}}{{else}}{{.LatestRun.RequiredIPCount}}{{end}}</strong></div>
+        <div class="metric"><span>通过全部筛选的 IP</span><strong>{{.LatestRun.UpdatedIPCount}} / {{.LatestRun.RequiredIPCount}}</strong></div>
+        <div class="metric"><span>Cloudflare 已核验记录（逐条）</span><strong>{{.LatestRun.SyncedIPCount}} / {{if .LatestRun.RequiredDNSRecordCount}}{{.LatestRun.RequiredDNSRecordCount}}{{else}}{{.LatestRun.RequiredIPCount}}{{end}}</strong></div>
         <div class="metric"><span>结果</span><strong>{{.LatestRun.Status}}</strong></div>
       </div>
+      {{template "runPlan" .LatestRun.Plan}}
     {{else}}
       <p class="muted">还没有执行记录。</p>
     {{end}}
@@ -6201,7 +6326,7 @@ const runTemplate = `
   {{end}}
   <div class="grid">
     <div class="metric"><span>今日更新 IP</span><strong>{{.Stats.TodayUpdatedIPs}}</strong></div>
-    <div class="metric"><span>今日确认 DNS 记录</span><strong>{{.Stats.TodaySyncedIPs}}</strong></div>
+    <div class="metric"><span>今日已由 Cloudflare 核验的记录</span><strong>{{.Stats.TodaySyncedIPs}}</strong></div>
     <div class="metric"><span>今日任务</span><strong>{{.Stats.TodayTaskCount}}</strong></div>
     <div class="metric"><span>定时策略</span><strong>{{.ScheduleSummary}}</strong></div>
     <div class="metric"><span>地区筛选</span><strong>{{.LocationSummary}}</strong></div>
@@ -6210,11 +6335,7 @@ const runTemplate = `
 <section class="panel">
   <h2>当前任务实时日志</h2>
   {{if .CurrentRun}}
-    <div class="metric" style="margin-bottom:14px">
-      <span>本次任务实际执行配置</span>
-      <strong>{{.CurrentRun.Summary}}</strong>
-      <p class="muted">这里显示的是任务创建时已经保存并冻结的非敏感配置，不受配置页尚未保存的修改影响。Cloudflare 密钥和真连接节点不会复制进任务快照；服务重启后续接时按稳定 ID / 当前已保存节点安全解析。</p>
-    </div>
+    <p class="muted">下面先列出本轮冻结的实际执行计划，再显示进度和日志；配置页尚未保存的修改不会影响当前任务。</p>
   {{end}}
   {{template "runs" .}}
 </section>
@@ -6234,7 +6355,7 @@ const historyTemplate = `
   {{if .RecentRuns}}
   <div class="table-wrap">
     <table style="min-width:760px">
-      <thead><tr><th>时间</th><th>触发</th><th>状态</th><th>阶段</th><th>IP</th><th>DNS</th><th>操作</th></tr></thead>
+      <thead><tr><th>时间</th><th>触发</th><th>状态</th><th>阶段</th><th>通过筛选 IP</th><th>Cloudflare 已核验记录</th><th>操作</th></tr></thead>
       <tbody>{{range .RecentRuns}}
         <tr>
           <td>{{.StartedAt}}</td>
@@ -6278,6 +6399,31 @@ const resultsPageTemplate = `
 `
 
 const runsTemplate = `
+{{define "runPlan"}}
+  {{if .Available}}
+    <section class="run-plan">
+      <h3>本轮实际执行计划</h3>
+      <div class="grid">
+        <div class="metric"><span>扫描协议与数量</span><strong>{{.ScanText}}</strong></div>
+        <div class="metric"><span>真连接准入条件</span><strong>{{.TrueConnectionText}}</strong></div>
+        <div class="metric"><span>本轮 DNS 写入与复核</span><strong>{{.DNSHeadline}}</strong></div>
+      </div>
+      {{if .ActiveTargets}}
+        <strong class="section-title">实际参与本轮 DNS 的目标</strong>
+        <ul class="compact-list">
+          {{range .ActiveTargets}}<li><span>{{.Name}} · {{.RecordName}}</span><strong>{{.RecordsText}}</strong></li>{{end}}
+        </ul>
+      {{end}}
+      {{if .SkippedTargets}}
+        <strong class="section-title skipped">本轮跳过的目标</strong>
+        <ul class="compact-list skipped">
+          {{range .SkippedTargets}}<li><span>{{.Name}} · {{.RecordName}}</span><strong>{{.Reason}}</strong></li>{{end}}
+        </ul>
+      {{end}}
+      <p class="muted">“记录”是每个 IP 在每个域名下的一条 A 或 AAAA；“域名目标完成”表示该目标的整组记录已经写入，并从 Cloudflare 重新查询确认完全一致。</p>
+    </section>
+  {{end}}
+{{end}}
 {{define "runs"}}
   {{if .RecentRuns}}
     {{range .RecentRuns}}
@@ -6288,12 +6434,13 @@ const runsTemplate = `
           · {{.StartedAt}}
           · {{.Stage}}
         </summary>
+        {{template "runPlan" .Plan}}
         <div class="progress"><div style="width: {{.Progress}}%"></div></div>
         <ul class="compact-list">
-          <li><span>更新 IP</span><strong>{{.UpdatedIPCount}} / {{.RequiredIPCount}}</strong></li>
-          <li><span>确认 DNS 记录</span><strong>{{.SyncedIPCount}} / {{if .RequiredDNSRecordCount}}{{.RequiredDNSRecordCount}}{{else}}{{.RequiredIPCount}}{{end}}</strong></li>
-          {{if .PlannedDNSTargetCount}}<li><span>确认 DNS 目标</span><strong>{{.ConfirmedDNSTargetCount}} / {{.PlannedDNSTargetCount}}</strong></li>{{end}}
-          <li><span>摘要</span><strong>{{.Summary}}</strong></li>
+          <li><span>通过全部筛选的 IP</span><strong>{{.UpdatedIPCount}} / {{.RequiredIPCount}}</strong></li>
+          <li><span>Cloudflare 已核验记录（逐条）</span><strong>{{.SyncedIPCount}} / {{if .RequiredDNSRecordCount}}{{.RequiredDNSRecordCount}}{{else}}{{.RequiredIPCount}}{{end}}</strong></li>
+          {{if .PlannedDNSTargetCount}}<li><span>已完成同步并复核的域名目标</span><strong>{{.ConfirmedDNSTargetCount}} / {{.PlannedDNSTargetCount}}</strong></li>{{end}}
+          {{if not .Plan.Available}}<li><span>旧任务摘要</span><strong>{{.Summary}}</strong></li>{{end}}
         </ul>
         {{if .DNSTargetResults}}
           <div class="metric-grid" style="margin-top:12px">

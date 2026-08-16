@@ -111,6 +111,43 @@ func TestRunSummaryFreezesStrictLocationAndCounts(t *testing.T) {
 	}
 }
 
+func TestRunPlanSeparatesConfiguredFamiliesFromCurrentExecution(t *testing.T) {
+	settings := defaultSettings()
+	settings.IPv4Enabled = true
+	settings.IPv4Count = 10
+	settings.IPv6Enabled = false
+	settings.IPv6Count = 0
+	settings.TrueConnectionIPv4 = true
+	settings.TrueConnectionIPv6 = false
+	settings.TrueConnectionHTTP = true
+	settings.TrueConnectionHTTPS = true
+	settings.DNSTargets = []DNSTargetConfig{
+		{Name: "原 IPv4 目标", RecordName: "speedv4.example.com", RecordFamily: "ipv4", Enabled: true},
+		{Name: "原 IPv6 目标", RecordName: "speedv6.example.com", RecordFamily: "ipv6", Enabled: true},
+		{Name: "speedmix", RecordName: "speedmix.example.com", RecordFamily: "both", Enabled: true},
+	}
+
+	plan := buildRunPlan(settings)
+	if plan.ScanText != "IPv4：10 个；IPv6：不执行" {
+		t.Fatalf("unexpected scan text: %q", plan.ScanText)
+	}
+	if plan.DNSHeadline != "2 个域名目标；20 条 A；0 条 AAAA" {
+		t.Fatalf("unexpected DNS headline: %q", plan.DNSHeadline)
+	}
+	if len(plan.ActiveTargets) != 2 || len(plan.SkippedTargets) != 1 {
+		t.Fatalf("unexpected plan targets: active=%+v skipped=%+v", plan.ActiveTargets, plan.SkippedTargets)
+	}
+	if !strings.Contains(plan.ActiveTargets[1].RecordsText, "IPv6 未启用，不写 AAAA") {
+		t.Fatalf("mixed target omission is not explained: %+v", plan.ActiveTargets[1])
+	}
+	if !strings.Contains(plan.SkippedTargets[0].Reason, "IPv6 未启用") {
+		t.Fatalf("IPv6-only target skip is not explained: %+v", plan.SkippedTargets[0])
+	}
+	if got := runSummary("manual", settings, GeoFilterStats{}); !strings.Contains(got, "本轮 DNS：2 个域名目标，20 条 A，0 条 AAAA") || strings.Contains(got, "支持 AAAA") {
+		t.Fatalf("run summary is still ambiguous: %q", got)
+	}
+}
+
 func TestRegionalHintSubnetsUseMatchingHistoricalResults(t *testing.T) {
 	app := &App{store: &Store{state: AppState{Results: []IPTestResult{
 		{IP: "162.159.39.76", IPVersion: 4, DataCenterCountry: "JP", DataCenterCity: "Tokyo"},
@@ -205,7 +242,7 @@ func TestCandidateSourceForIP(t *testing.T) {
 }
 
 func TestVersionAndRepositoryAreExposed(t *testing.T) {
-	if appVersion != "v1.1.0" || repositoryURL != "https://github.com/samni728/better-cf" {
+	if appVersion != "v1.1.1" || repositoryURL != "https://github.com/samni728/better-cf" {
 		t.Fatalf("version metadata = %s / %s", appVersion, repositoryURL)
 	}
 	if defaultSettings().SearchNetworkLabel != "213 VPS" {
