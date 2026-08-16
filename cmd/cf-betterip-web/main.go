@@ -45,8 +45,9 @@ type App struct {
 }
 
 const (
-	appVersion    = "v1.1.1"
-	repositoryURL = "https://github.com/samni728/better-cf"
+	appVersion               = "v1.2.0"
+	repositoryURL            = "https://github.com/samni728/better-cf"
+	scannerObservationPrefix = "@@BETTER_CF_OBSERVATION@@"
 )
 
 type Store struct {
@@ -235,6 +236,19 @@ type IPTestResult struct {
 	ConfirmedDNSTargets     int                        `json:"confirmed_dns_targets,omitempty"`
 	PlannedDNSTargets       int                        `json:"planned_dns_targets,omitempty"`
 	TestedAt                string                     `json:"tested_at"`
+}
+
+type scannerStageObservation struct {
+	Stage             string `json:"stage"`
+	IP                string `json:"ip"`
+	IPVersion         int    `json:"ip_version"`
+	DataCenterCode    string `json:"dc_code,omitempty"`
+	DataCenterCountry string `json:"dc_country,omitempty"`
+	DataCenterRegion  string `json:"dc_region,omitempty"`
+	DataCenterCity    string `json:"dc_city,omitempty"`
+	RTTMs             int    `json:"rtt_ms,omitempty"`
+	MaxRTTMs          int    `json:"max_rtt_ms,omitempty"`
+	PeakSpeedKBps     int    `json:"peak_speed_kbps,omitempty"`
 }
 
 type TrueConnectionPortResult struct {
@@ -2813,7 +2827,7 @@ func (a *App) collectFamilyResults(ctx context.Context, id string, settings Sett
 	if profileID != "" {
 		if loaded, err := a.searchMemory.Candidates(ctx, profileID, ipVersion, time.Now()); err == nil {
 			memory = loaded
-			a.store.appendRunLog(id, "info", fmt.Sprintf("搜索记忆已加载：近期成功 IP %d 个、优先层级网段 %d 个（手动 %d 个）、冷却 IP %d 个、冷却网段 %d 个；本轮预算 精确:%d%% /24或/48:%d%% /16或/32:%d%% 全局:%d%%。", len(memory.SuccessIPs), len(memory.HintPrefixes), len(memory.ManualPrefixes), len(memory.ExcludeIPs), len(memory.ExcludePrefixes), memory.Budget.Exact, memory.Budget.Narrow, memory.Budget.Wide, memory.Budget.Global))
+			a.store.appendRunLog(id, "info", fmt.Sprintf("搜索记忆已加载：可复测的真连接/带宽候选 IP %d 个、实测地区优先网段 %d 个（手动 %d 个）、冷却 IP %d 个、冷却网段 %d 个；本轮预算 精确:%d%% /24或/48:%d%% /16或/32:%d%% 全局:%d%%。", len(memory.SuccessIPs), len(memory.HintPrefixes), len(memory.ManualPrefixes), len(memory.ExcludeIPs), len(memory.ExcludePrefixes), memory.Budget.Exact, memory.Budget.Narrow, memory.Budget.Wide, memory.Budget.Global))
 		} else {
 			a.store.appendRunLog(id, "warn", "搜索记忆读取失败，本轮退回无记忆扫描："+err.Error())
 		}
@@ -2836,7 +2850,7 @@ func (a *App) collectFamilyResults(ctx context.Context, id string, settings Sett
 		}
 		historyIPs = filterUnseenIPs(historyIPs, seen)
 		if attempt == 1 && len(hintSubnets) > 0 {
-			a.store.appendRunLog(id, "info", fmt.Sprintf("历史经验已加载：%d 个可重测 IPv%d，%d 个地区优先子网。先复测具体 IP，再从成功子网生成新 IP，同时继续遍历原版全局地址池。", len(historyIPs), ipVersion, len(hintSubnets)))
+			a.store.appendRunLog(id, "info", fmt.Sprintf("两阶段搜索开始：先复测 %d 个 IPv%d 历史候选，并按 %d 个实测线索从父网段 /16（IPv6 /32）广泛探索；一旦命中实际机房，再收窄到 /24（IPv6 /48）深挖。带宽候选合格后才进入 HTTP/HTTPS 真连接。", len(historyIPs), ipVersion, len(hintSubnets)))
 		}
 
 		resultDeadline := lastResultAt.Add(noResultTimeout)
@@ -2845,8 +2859,15 @@ func (a *App) collectFamilyResults(ctx context.Context, id string, settings Sett
 			a.store.appendRunLog(id, "info", message)
 		})
 		cancel()
-		if output != "" {
-			a.store.appendRunLog(id, "info", trimForLog(output, 1200))
+		stageObservations := parseScannerStageObservations(output)
+		learnedHints, stageCounts := a.recordScannerStageObservations(id, profileID, settings, ipVersion, historyIPs, hintSubnets, stageObservations)
+		memory.HintPrefixes = appendUniqueStrings(memory.HintPrefixes, learnedHints...)
+		if stageCounts["region_match"] > 0 {
+			a.store.appendRunLog(id, "info", fmt.Sprintf("阶段记忆已保存：实测地区命中 %d 个，带宽达标 %d 个、未达标 %d 个；已将对应 /24 与 /16（IPv6 为 /48 与 /32）加入后续优先范围。", stageCounts["region_match"], stageCounts["bandwidth_pass"], stageCounts["bandwidth_fail"]))
+		}
+		visibleOutput := stripScannerObservationLines(output)
+		if visibleOutput != "" {
+			a.store.appendRunLog(id, "info", trimForLog(visibleOutput, 1200))
 		}
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
@@ -2889,7 +2910,7 @@ func (a *App) collectFamilyResults(ctx context.Context, id string, settings Sett
 		result.ConfiguredBandwidthMbps = settings.BandwidthMbps
 		result.CandidateSource = candidateSourceForIP(result.IP, historyIPs, hintSubnets, ipVersion)
 		if trueConnectionEnabledForFamily(settings, ipVersion) {
-			a.store.appendRunLog(id, "info", fmt.Sprintf("开始 IPv%d 真连接测试：%s；将完整检测所选协议的全部 Cloudflare 端口。", ipVersion, result.IP))
+			a.store.appendRunLog(id, "info", fmt.Sprintf("阶段 1 已完成：%s 通过地区、RTT 与带宽门槛，已进入带宽候选池。开始阶段 2 真连接验证；将完整检测所选协议的全部 Cloudflare 端口。", result.IP))
 			ports, portAttempts, trueErr := runTrueConnectionTests(ctx, settings, result.IP)
 			if trueErr != nil {
 				return results, fmt.Errorf("IPv%d 真连接测试无法继续：%w", ipVersion, trueErr)
@@ -3128,7 +3149,7 @@ loop:
 		case <-heartbeat.C:
 			output := builder.String()
 			if len(output) > lastLoggedLen {
-				delta := output[lastLoggedLen:]
+				delta := stripScannerObservationLines(output[lastLoggedLen:])
 				lastLoggedLen = len(output)
 				if strings.TrimSpace(delta) != "" {
 					onLog("脚本实时输出：" + trimForLog(delta, 900))
@@ -3219,6 +3240,77 @@ func parseBetterIPOutput(output string) (IPTestResult, error) {
 		return result, errors.New("未解析到优选 IP")
 	}
 	return result, nil
+}
+
+func parseScannerStageObservations(output string) []scannerStageObservation {
+	seen := make(map[string]bool)
+	var result []scannerStageObservation
+	for _, line := range strings.Split(output, "\n") {
+		index := strings.Index(line, scannerObservationPrefix)
+		if index < 0 {
+			continue
+		}
+		raw := strings.TrimSpace(line[index+len(scannerObservationPrefix):])
+		var item scannerStageObservation
+		if json.Unmarshal([]byte(raw), &item) != nil || item.IP == "" || item.IPVersion == 0 {
+			continue
+		}
+		switch item.Stage {
+		case "region_match", "bandwidth_pass", "bandwidth_fail":
+		default:
+			continue
+		}
+		key := item.Stage + "|" + item.IP
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		result = append(result, item)
+	}
+	return result
+}
+
+func stripScannerObservationLines(output string) string {
+	if !strings.Contains(output, scannerObservationPrefix) {
+		return output
+	}
+	lines := strings.Split(output, "\n")
+	visible := lines[:0]
+	for _, line := range lines {
+		if index := strings.Index(line, scannerObservationPrefix); index >= 0 {
+			line = strings.TrimSpace(line[:index])
+		}
+		if strings.TrimSpace(line) != "" {
+			visible = append(visible, line)
+		}
+	}
+	return strings.Join(visible, "\n")
+}
+
+func (a *App) recordScannerStageObservations(runID, profileID string, settings Settings, ipVersion int, exactIPs, hints []string, items []scannerStageObservation) ([]string, map[string]int) {
+	counts := map[string]int{"region_match": 0, "bandwidth_pass": 0, "bandwidth_fail": 0}
+	var learnedHints []string
+	for _, item := range items {
+		if item.IPVersion != ipVersion {
+			continue
+		}
+		candidate := IPTestResult{
+			RunID: runID, IP: item.IP, IPVersion: ipVersion,
+			DataCenterCode: item.DataCenterCode, DataCenterCountry: item.DataCenterCountry,
+			DataCenterRegion: item.DataCenterRegion, DataCenterCity: item.DataCenterCity,
+			RTTMs: item.RTTMs, PeakSpeedKBps: item.PeakSpeedKBps,
+			MeasuredBandwidthMbps: item.PeakSpeedKBps / 128,
+			CandidateSource:       candidateSourceForIP(item.IP, exactIPs, hints, ipVersion),
+		}
+		// “地区优先”回退全局后可能出现非目标机房，这些结果不能污染目标地区记忆。
+		if normalizeLocationMode(settings.LocationMode) != "any" && !resultMatchesLocation(candidate, settings) {
+			continue
+		}
+		a.recordSearchObservation(runID, profileID, candidate, item.Stage, "", nil)
+		learnedHints = appendUniqueStrings(learnedHints, resultHintPrefixes(item.IP, ipVersion)...)
+		counts[item.Stage]++
+	}
+	return learnedHints, counts
 }
 
 var (
@@ -5901,7 +5993,7 @@ const settingsTemplate = `
         </div>
         <div class="grid">
           <div class="metric"><span>近 7 天覆盖</span><strong>{{$insight.RecentUniqueIPs}} IP / {{$insight.RecentPrefixes}} 网段</strong><p class="muted">采样覆盖率 {{printf "%.2f" $insight.CoveragePercent}}%</p></div>
-          <div class="metric"><span>成功 / 失败</span><strong>{{$insight.Summary.Successes}} / {{$insight.Summary.Failures}}</strong><p class="muted">3 天内新鲜成功 {{$insight.Summary.HotSuccesses}}</p></div>
+          <div class="metric"><span>真连接成功 / 失败</span><strong>{{$insight.Summary.Successes}} / {{$insight.Summary.Failures}}</strong><p class="muted">地区命中 {{$insight.Summary.RegionMatches}} · 带宽达标 {{$insight.Summary.BandwidthPasses}} / 未达标 {{$insight.Summary.BandwidthFails}}</p></div>
           <div class="metric"><span>当前自适应预算</span><strong>精确 {{$insight.Budget.Exact}}% · 窄 {{$insight.Budget.Narrow}}%</strong><p class="muted">父网段 {{$insight.Budget.Wide}}% · 全局 {{$insight.Budget.Global}}%</p></div>
           <div class="metric"><span>出口 / 运营商</span><strong>{{if $profile.NetworkLabel}}{{$profile.NetworkLabel}}{{else}}未标记{{end}}</strong><p class="muted">{{.ModeLabel}}</p></div>
         </div>

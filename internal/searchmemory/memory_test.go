@@ -43,6 +43,35 @@ func TestSuccessBuildsNarrowAndWideHints(t *testing.T) {
 	}
 }
 
+func TestRegionalAndBandwidthStagesBecomeHintsAndCooldownFailedExactIP(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "memory.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	now := time.Now().UTC()
+	profileID, err := store.EnsureProfile(ctx, Profile{IPVersion: 4, Country: "KR", BandwidthMbps: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index, outcome := range []string{"region_match", "bandwidth_fail"} {
+		if err := store.Record(ctx, Observation{ProfileID: profileID, IP: "172.71.111.98", IPVersion: 4, Outcome: outcome, TestedAt: now.Add(time.Duration(index) * time.Nanosecond)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	memory, err := store.Candidates(ctx, profileID, 4, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(memory.HintPrefixes, "172.71.111.0/24") || !slices.Contains(memory.HintPrefixes, "172.71.0.0/16") {
+		t.Fatalf("stage hints=%v", memory.HintPrefixes)
+	}
+	if !slices.Contains(memory.ExcludeIPs, "172.71.111.98") {
+		t.Fatalf("bandwidth failure should cool exact IP: %v", memory.ExcludeIPs)
+	}
+}
+
 func TestFailuresCoolExactIPAndPrefix(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "memory.sqlite"))
 	if err != nil {

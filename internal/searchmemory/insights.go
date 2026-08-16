@@ -207,7 +207,8 @@ func (s *Store) ProfileInsight(ctx context.Context, profileID string, profile Pr
 	}
 	cutoff := now.Add(-7 * 24 * time.Hour).UTC().Format(time.RFC3339Nano)
 	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(DISTINCT ip), COUNT(DISTINCT prefix_narrow)
-		FROM ip_observations WHERE profile_id=? AND ip_version=? AND outcome IN ('true_success','true_failure') AND tested_at>=?`, profileID, profile.IPVersion, cutoff).
+		FROM ip_observations WHERE profile_id=? AND ip_version=?
+		AND outcome IN ('true_success','true_failure','scan_success','bandwidth_pass','bandwidth_fail','region_match') AND tested_at>=?`, profileID, profile.IPVersion, cutoff).
 		Scan(&result.RecentUniqueIPs, &result.RecentPrefixes); err != nil {
 		return result, err
 	}

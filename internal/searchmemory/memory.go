@@ -95,6 +95,9 @@ type Summary struct {
 	Successes       int
 	Failures        int
 	HotSuccesses    int
+	RegionMatches   int
+	BandwidthPasses int
+	BandwidthFails  int
 	CoolingIPs      int
 	CoolingPrefixes int
 	LastObservedAt  string
@@ -357,8 +360,11 @@ func (s *Store) Candidates(ctx context.Context, profileID string, version int, n
 	sevenDays := now.Add(-7 * 24 * time.Hour).UTC().Format(time.RFC3339Nano)
 	threeDays := now.Add(-3 * 24 * time.Hour).UTC().Format(time.RFC3339Nano)
 	oneDay := now.Add(-24 * time.Hour).UTC().Format(time.RFC3339Nano)
+	sixHours := now.Add(-6 * time.Hour).UTC().Format(time.RFC3339Nano)
 	rows, err := s.db.QueryContext(ctx, `SELECT ip, MAX(tested_at) latest FROM ip_observations
-		WHERE profile_id=? AND ip_version=? AND outcome='true_success' AND tested_at>=?
+		WHERE profile_id=? AND ip_version=? AND outcome IN ('true_success','scan_success','bandwidth_pass') AND tested_at>=?
+		AND NOT EXISTS (SELECT 1 FROM ip_observations f WHERE f.profile_id=ip_observations.profile_id
+			AND f.ip=ip_observations.ip AND f.outcome='true_failure' AND f.tested_at>ip_observations.tested_at)
 		GROUP BY ip ORDER BY latest DESC LIMIT 100`, profileID, version, sevenDays)
 	if err != nil {
 		return memory, err
@@ -372,21 +378,38 @@ func (s *Store) Candidates(ctx context.Context, profileID string, version int, n
 	rows.Close()
 
 	rows, err = s.db.QueryContext(ctx, `SELECT prefix_narrow, prefix_wide,
-		SUM(CASE WHEN outcome='true_success' THEN 1 ELSE 0 END) successes,
-		SUM(CASE WHEN outcome='true_success' AND tested_at>=? THEN 1 ELSE 0 END) hot_successes,
+		SUM(CASE outcome WHEN 'true_success' THEN 12 WHEN 'scan_success' THEN 10 WHEN 'bandwidth_pass' THEN 8 WHEN 'bandwidth_fail' THEN 3 WHEN 'true_failure' THEN 2 WHEN 'region_match' THEN 1 ELSE 0 END) score,
+		SUM(CASE WHEN tested_at>=? THEN CASE outcome WHEN 'true_success' THEN 12 WHEN 'scan_success' THEN 10 WHEN 'bandwidth_pass' THEN 8 WHEN 'bandwidth_fail' THEN 3 WHEN 'true_failure' THEN 2 WHEN 'region_match' THEN 1 ELSE 0 END ELSE 0 END) hot_score,
 		MAX(tested_at) latest FROM ip_observations WHERE profile_id=? AND ip_version=? AND tested_at>=?
-		GROUP BY prefix_narrow,prefix_wide HAVING successes>0 ORDER BY hot_successes DESC,successes DESC,latest DESC LIMIT 20`, threeDays, profileID, version, sevenDays)
+		AND outcome IN ('true_success','scan_success','bandwidth_pass','bandwidth_fail','true_failure','region_match')
+		GROUP BY prefix_narrow,prefix_wide HAVING score>0 ORDER BY hot_score DESC,score DESC,latest DESC LIMIT 20`, threeDays, profileID, version, sevenDays)
 	if err != nil {
 		return memory, err
 	}
 	prefixScore := make(map[string]int)
 	for rows.Next() {
 		var narrow, wide, latest string
-		var successes, hotSuccesses int
-		if rows.Scan(&narrow, &wide, &successes, &hotSuccesses, &latest) == nil {
-			// 三天内的新鲜成功权重更高，三至七天的成功仍可作为较弱探索线索。
-			prefixScore[narrow] += successes*3 + hotSuccesses*6
-			prefixScore[wide] += successes + hotSuccesses*2
+		var score, hotScore int
+		if rows.Scan(&narrow, &wide, &score, &hotScore, &latest) == nil {
+			// 地区命中即可保留父网段线索；带宽和真连接越靠后，优先级越高。
+			prefixScore[narrow] += score*3 + hotScore*2
+			prefixScore[wide] += score + hotScore
+		}
+	}
+	rows.Close()
+
+	rows, err = s.db.QueryContext(ctx, `SELECT f.ip FROM ip_observations f
+		WHERE f.profile_id=? AND f.ip_version=? AND f.outcome='bandwidth_fail' AND f.tested_at>=?
+		AND NOT EXISTS (SELECT 1 FROM ip_observations s2 WHERE s2.profile_id=f.profile_id AND s2.ip=f.ip
+			AND s2.outcome IN ('bandwidth_pass','scan_success','true_success') AND s2.tested_at>f.tested_at)
+		GROUP BY f.ip LIMIT 2000`, profileID, version, sixHours)
+	if err != nil {
+		return memory, err
+	}
+	for rows.Next() {
+		var ip string
+		if rows.Scan(&ip) == nil {
+			memory.ExcludeIPs = append(memory.ExcludeIPs, ip)
 		}
 	}
 	rows.Close()
@@ -454,9 +477,12 @@ func (s *Store) Summary(ctx context.Context, profileID string, version int, now 
 		COALESCE(SUM(CASE WHEN outcome='true_success' THEN 1 ELSE 0 END),0),
 		COALESCE(SUM(CASE WHEN outcome='true_failure' THEN 1 ELSE 0 END),0),
 		COALESCE(SUM(CASE WHEN outcome='true_success' AND tested_at>=? THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN outcome='region_match' THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN outcome='bandwidth_pass' THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN outcome='bandwidth_fail' THEN 1 ELSE 0 END),0),
 		MAX(tested_at) FROM ip_observations WHERE profile_id=?`, now.Add(-3*24*time.Hour).UTC().Format(time.RFC3339Nano), profileID)
 	var last sql.NullString
-	if err := row.Scan(&result.Observations, &result.Successes, &result.Failures, &result.HotSuccesses, &last); err != nil {
+	if err := row.Scan(&result.Observations, &result.Successes, &result.Failures, &result.HotSuccesses, &result.RegionMatches, &result.BandwidthPasses, &result.BandwidthFails, &last); err != nil {
 		return result, err
 	}
 	if last.Valid {

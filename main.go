@@ -185,7 +185,7 @@ func cloudflareTest(ipType int, useTLS bool, taskNum int, speed int, maxRTTMs in
 	}
 	hintSubnets := hintSubnetsFromEnv(ipType)
 	if len(hintSubnets) > 0 {
-		fmt.Printf("已从历史成功结果提取 %d 个 IPv%d 优先子网，每轮会先从这些子网生成新 IP。\n", len(hintSubnets), ipType)
+		fmt.Printf("已从历史地区命中、带宽及真连接结果提取 %d 个 IPv%d 优先网段，每轮会先按父网段广泛探索，再从命中的窄网段深挖。\n", len(hintSubnets), ipType)
 	}
 	historyIPs := hintIPsFromEnv(ipType)
 	budget := candidateBudgetFromEnv()
@@ -249,6 +249,9 @@ func cloudflareTest(ipType int, useTLS bool, taskNum int, speed int, maxRTTMs in
 				fmt.Printf("本轮新发现 %d 个实测匹配子网；即使当前 IP 带宽未达标，下一轮也会优先从这些子网扩展新 IP。\n", added)
 			}
 		}
+		for _, result := range rttResults {
+			emitScannerObservation("region_match", result, ipType, 0)
+		}
 
 		fmt.Println("待测速的 IP 地址")
 		for _, r := range rttResults {
@@ -269,6 +272,9 @@ func cloudflareTest(ipType int, useTLS bool, taskNum int, speed int, maxRTTMs in
 			}
 			fmt.Println()
 			if maxSpeed < speed {
+				emitScannerObservation("bandwidth_fail", r, ipType, maxSpeed)
+				// 同一进程内不再重复测速这个失败 IP；它所在的 /24 与 /16 仍会继续扩展。
+				excludeIPs[r.IP] = true
 				continue
 			}
 			if r.DataCenterCode != "" && dc != "" && !strings.EqualFold(r.DataCenterCode, dc) {
@@ -307,6 +313,11 @@ func cloudflareTest(ipType int, useTLS bool, taskNum int, speed int, maxRTTMs in
 			if dc == "" {
 				dc = postDC
 			}
+			stableResult := r
+			stableResult.LatencyMs = stableAvgMs
+			stableResult.MaxLatencyMs = stableMaxMs
+			stableResult.DataCenterCode = dc
+			emitScannerObservation("bandwidth_pass", stableResult, ipType, maxSpeed)
 			return r.IP, maxSpeed, stableAvgMs, dc
 		}
 		fmt.Println("当前所有 IP 都未达到期望带宽，重新开始新一轮测试...")
@@ -323,6 +334,37 @@ type candidateBudget struct {
 	Narrow int
 	Wide   int
 	Global int
+}
+
+const scannerObservationPrefix = "@@BETTER_CF_OBSERVATION@@"
+
+type scannerObservation struct {
+	Stage             string `json:"stage"`
+	IP                string `json:"ip"`
+	IPVersion         int    `json:"ip_version"`
+	DataCenterCode    string `json:"dc_code,omitempty"`
+	DataCenterCountry string `json:"dc_country,omitempty"`
+	DataCenterRegion  string `json:"dc_region,omitempty"`
+	DataCenterCity    string `json:"dc_city,omitempty"`
+	RTTMs             int    `json:"rtt_ms,omitempty"`
+	MaxRTTMs          int    `json:"max_rtt_ms,omitempty"`
+	PeakSpeedKBps     int    `json:"peak_speed_kbps,omitempty"`
+}
+
+// emitScannerObservation 输出给 Web 编排层使用的机器可读阶段结果。
+// 普通用户日志会过滤这些标记，只保留相应的中文阶段摘要。
+func emitScannerObservation(stage string, result RTTResult, ipType, peakSpeedKBps int) {
+	location := lookupLocation(result.DataCenterCode)
+	item := scannerObservation{
+		Stage: stage, IP: result.IP, IPVersion: ipType,
+		DataCenterCode: result.DataCenterCode, DataCenterCountry: location.Cca2,
+		DataCenterRegion: location.Region, DataCenterCity: location.City,
+		RTTMs: result.LatencyMs, MaxRTTMs: result.MaxLatencyMs, PeakSpeedKBps: peakSpeedKBps,
+	}
+	raw, err := json.Marshal(item)
+	if err == nil {
+		fmt.Println(scannerObservationPrefix + string(raw))
+	}
 }
 
 func candidateBudgetFromEnv() candidateBudget {
@@ -653,21 +695,23 @@ func extendHintSubnets(existing []string, results []RTTResult, ipType int) []str
 	for _, subnet := range extended {
 		seen[subnet] = true
 	}
-	bits := 48
-	if ipType == 4 {
-		bits = 24
-	}
 	for _, result := range results {
 		addr, err := netip.ParseAddr(result.IP)
 		if err != nil || (ipType == 4) != addr.Is4() {
 			continue
 		}
-		subnet := netip.PrefixFrom(addr, bits).Masked().String()
-		if seen[subnet] {
-			continue
+		bits := []int{48, 32}
+		if ipType == 4 {
+			bits = []int{24, 16}
 		}
-		seen[subnet] = true
-		extended = append(extended, subnet)
+		for _, prefixBits := range bits {
+			subnet := netip.PrefixFrom(addr, prefixBits).Masked().String()
+			if seen[subnet] {
+				continue
+			}
+			seen[subnet] = true
+			extended = append(extended, subnet)
+		}
 	}
 	return extended
 }

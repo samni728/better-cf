@@ -241,8 +241,20 @@ func TestCandidateSourceForIP(t *testing.T) {
 	}
 }
 
+func TestScannerStageObservationsAreParsedAndHiddenFromUserLog(t *testing.T) {
+	raw := "正在测试 172.71.111.98\n" + scannerObservationPrefix + `{"stage":"bandwidth_fail","ip":"172.71.111.98","ip_version":4,"dc_code":"ICN","dc_country":"KR","rtt_ms":3,"peak_speed_kbps":9909}` + "\n继续扫描\n"
+	items := parseScannerStageObservations(raw)
+	if len(items) != 1 || items[0].IP != "172.71.111.98" || items[0].Stage != "bandwidth_fail" || items[0].DataCenterCode != "ICN" {
+		t.Fatalf("parsed observations = %+v", items)
+	}
+	visible := stripScannerObservationLines(raw)
+	if strings.Contains(visible, scannerObservationPrefix) || !strings.Contains(visible, "正在测试") || !strings.Contains(visible, "继续扫描") {
+		t.Fatalf("visible output = %q", visible)
+	}
+}
+
 func TestVersionAndRepositoryAreExposed(t *testing.T) {
-	if appVersion != "v1.1.1" || repositoryURL != "https://github.com/samni728/better-cf" {
+	if appVersion != "v1.2.0" || repositoryURL != "https://github.com/samni728/better-cf" {
 		t.Fatalf("version metadata = %s / %s", appVersion, repositoryURL)
 	}
 	if defaultSettings().SearchNetworkLabel != "213 VPS" {

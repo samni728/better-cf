@@ -142,7 +142,7 @@ func TestExtendHintSubnetsLearnsFromMatchingRTTResults(t *testing.T) {
 		[]RTTResult{{IP: "162.159.39.76"}, {IP: "162.159.39.195"}},
 		4,
 	)
-	if len(got) != 2 || got[0] != "162.159.38.0/24" || got[1] != "162.159.39.0/24" {
+	if len(got) != 3 || got[0] != "162.159.38.0/24" || got[1] != "162.159.39.0/24" || got[2] != "162.159.0.0/16" {
 		t.Fatalf("extendHintSubnets() = %v", got)
 	}
 }
