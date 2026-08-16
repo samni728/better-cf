@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ "${ALLOW_VPS_RECOVERY_PULL:-}" != "I_UNDERSTAND_THIS_OVERWRITES_LOCAL" ]]; then
+  echo "Blocked: Mac is the authoritative source. This script is only for explicit disaster-recovery evidence collection." >&2
+  echo "If the user explicitly authorizes a VPS recovery pull, set ALLOW_VPS_RECOVERY_PULL=I_UNDERSTAND_THIS_OVERWRITES_LOCAL." >&2
+  exit 2
+fi
+
 VPS_HOST="${VPS_HOST:-}"
 VPS_USER="${VPS_USER:-root}"
 REMOTE_DIR="${REMOTE_DIR:-/root/cf-betterip/source/}"

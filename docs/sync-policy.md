@@ -1,100 +1,58 @@
-# 同步策略
+# 同步与部署策略
 
-## 主从关系
+## 唯一源码方向
 
-本项目以 VPS 上的源码目录为主：
+本项目以 Mac 本地目录为唯一开发源：
 
-```bash
-/root/cf-betterip/source
-```
-
-当前本地目录作为同步副本：
-
-```bash
+```text
 /Users/samni/Desktop/开发项目/cf-betterip-ser
 ```
 
-默认工作逻辑：
+213 VPS 只是运行与测速环境：
 
 ```text
-VPS source 是主项目
--> 本地目录从 VPS 拉取同步
--> 本地用于阅读、备份、文档查看和必要时辅助编辑
+/root/cf-betterip/source
 ```
 
-## 为什么这样做
-
-当前项目真正运行、测速和后续部署都发生在 VPS 上。把 VPS 作为主项目可以避免：
-
-- 本地代码和远端运行代码不一致。
-- 本地改了但忘记部署。
-- 文档、源码、运行数据混在不同位置。
-
-## 默认同步方向
-
-默认方向是：
+正常方向永远是：
 
 ```text
-VPS -> 本地
+Mac 本地源码 -> GitHub（需要发布时）-> 213 VPS
 ```
 
-也就是从：
+不得在普通开发或部署中从 VPS 反向覆盖 Mac 代码。VPS 上的源码差异只用于只读排查和紧急取证。
 
-```bash
-root@your-vps-ip:/root/cf-betterip/source/
-```
+## 远端目录边界
 
-同步到：
+- `/root/cf-betterip/source`：已部署源码。
+- `/root/cf-betterip/source/bin`：Linux 可执行文件。
+- `/root/cf-betterip/source/data`：WebUI 账号、Cloudflare 凭据、任务与历史数据；`search_memory.sqlite` 及其 WAL/SHM 保存搜寻经验。
+- `/root/cf-betterip/source/logs` 和 `web.log`：运行日志。
+- `/root/cf-betterip/backups`：部署前备份。
 
-```bash
-/Users/samni/Desktop/开发项目/cf-betterip-ser/
-```
+从 Mac 上传源码时必须排除远端 `.git/`、`data/`、`logs/`、`bin/` 和 `web.log`，再单独上传已验证的 Linux 二进制。不得使用未排除运行数据的 `rsync --delete`。
 
-## 本地同步命令
+## 标准部署顺序
 
-在本地当前目录执行：
+1. Mac 本地执行 `go test ./...`、`go vet ./...` 和必要的 race 测试。
+2. 构建 `linux/amd64` 静态二进制。
+3. 只读确认 213 没有正在运行的任务。
+4. 备份当前二进制、`data/app_state.json` 和远端源码。
+5. 单向上传 Mac 源码，不覆盖运行数据。
+6. 新二进制先使用临时端口和临时数据目录通过 `/healthz`。
+7. 原子替换正式二进制并重启。
+8. 验证 VPS 本机和 Mac 到 `:18080/healthz`，并检查进程、端口、数据版本与日志。
 
-```bash
-VPS_HOST='your-vps-ip' ./scripts/pull-from-vps.sh
-```
+部署前除 `app_state.json` 外，还要备份 `search_memory.sqlite*`。若 SQLite 已存在，最好先正常停止 Web 进程再做最终备份，确保 WAL 已完整落盘。
+9. 健康检查失败时，恢复部署前二进制与数据备份。
 
-该脚本默认：
+## 反向拉取限制
 
-- 使用 `rsync`。
-- 排除远端 `.git/`。
-- 排除远端运行产物 `bin/`、`data/`、`logs/`。
-- 不使用 `--delete`，避免删除本地额外文件，例如 `memo.md`。
-- 不在脚本中保存明文密码。
+`scripts/pull-from-vps.sh` 只保留为灾难恢复取证工具，不属于日常开发流程。必须由用户明确要求“从 VPS 恢复源码”后，才能带显式解锁参数执行。
 
-如果没有配置 SSH key，可以临时使用：
+## 安全要求
 
-```bash
-VPS_HOST='your-vps-ip' VPS_PASSWORD='your-password' ./scripts/pull-from-vps.sh
-```
-
-## 什么时候允许本地推回 VPS
-
-默认不主动从本地推回 VPS。只有在以下情况才考虑反向同步：
-
-- 明确确认本地改动是要进入远端主项目。
-- 先检查本地和远端差异。
-- 避免覆盖 VPS 上的新改动。
-
-后续如果需要，可以再增加 `scripts/push-to-vps.sh`，但第一阶段先保持单向同步，降低误覆盖风险。
-
-## 开发协作规则
-
-后续开发时优先遵循：
-
-1. 先查看 VPS 当前源码状态。
-2. 在 VPS 项目或从 VPS 拉下来的同步副本中规划修改。
-3. 修改完成后确保 VPS 上的源码是最新主版本。
-4. 再执行 `./scripts/pull-from-vps.sh` 更新本地副本。
-
-## 注意事项
-
-- `/root/cf-betterip` 是运行目录，包含二进制和数据文件。
-- `/root/cf-betterip/source` 是源码目录。
-- `/root/cf-betterip/source/data` 后续会保存 WebUI 配置和敏感 Token，不要同步到本地文档副本。
-- 不要把运行数据文件误当作源码提交。
-- 不要把 Cloudflare API Token、root 密码等敏感信息写进文档或脚本。
+- 不把 Cloudflare Token、Global API Key 或 VPS root 密码写入仓库、日志或部署脚本。
+- `data/app_state.json` 及其备份必须保持 `0600`。
+- 部署前不停止正在执行的优选任务。
+- 不从 VPS 将 `data/`、日志或密钥同步回 Mac 源码库。

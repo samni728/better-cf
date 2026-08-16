@@ -1,6 +1,7 @@
 package main
 
 import (
+	"net/netip"
 	"os"
 	"testing"
 	"time"
@@ -143,5 +144,72 @@ func TestExtendHintSubnetsLearnsFromMatchingRTTResults(t *testing.T) {
 	)
 	if len(got) != 2 || got[0] != "162.159.38.0/24" || got[1] != "162.159.39.0/24" {
 		t.Fatalf("extendHintSubnets() = %v", got)
+	}
+}
+
+func TestHierarchicalCandidatesUseHintsAndRespectCooldown(t *testing.T) {
+	sampler := newSubnetSampler([]string{"104.16.0.0/24", "104.17.0.0/24"})
+	excluded := []netip.Prefix{netip.MustParsePrefix("172.66.130.0/24")}
+	got := hierarchicalCandidateIPs(sampler, []string{"172.66.130.0/24", "172.66.0.0/16"}, map[string]bool{"104.16.0.1": true}, excluded, 40, 4, candidateBudget{Exact: 15, Narrow: 30, Wide: 20, Global: 35})
+	if len(got) != 40 {
+		t.Fatalf("hierarchicalCandidateIPs returned %d candidates, want 40", len(got))
+	}
+	seen := make(map[string]bool)
+	usedParentHint := false
+	parent := netip.MustParsePrefix("172.66.0.0/16")
+	for _, raw := range got {
+		addr := netip.MustParseAddr(raw)
+		if excluded[0].Contains(addr) {
+			t.Fatalf("candidate %s belongs to cooled prefix", raw)
+		}
+		if raw == "104.16.0.1" {
+			t.Fatalf("candidate %s belongs to cooled exact IP", raw)
+		}
+		if seen[raw] {
+			t.Fatalf("candidate %s was repeated", raw)
+		}
+		seen[raw] = true
+		if parent.Contains(addr) {
+			usedParentHint = true
+		}
+	}
+	if !usedParentHint {
+		t.Fatal("expected candidates to explore the successful parent /16")
+	}
+}
+
+func TestCandidateBudgetFromEnv(t *testing.T) {
+	t.Setenv("BETTER_CF_BUDGET_EXACT", "10")
+	t.Setenv("BETTER_CF_BUDGET_NARROW", "40")
+	t.Setenv("BETTER_CF_BUDGET_WIDE", "30")
+	t.Setenv("BETTER_CF_BUDGET_GLOBAL", "20")
+	if got := candidateBudgetFromEnv(); got != (candidateBudget{Exact: 10, Narrow: 40, Wide: 30, Global: 20}) {
+		t.Fatalf("candidateBudgetFromEnv = %+v", got)
+	}
+	t.Setenv("BETTER_CF_BUDGET_GLOBAL", "19")
+	if got := candidateBudgetFromEnv(); got != (candidateBudget{Exact: 15, Narrow: 30, Wide: 20, Global: 35}) {
+		t.Fatalf("invalid budget did not fall back: %+v", got)
+	}
+}
+
+func TestHierarchicalCandidatesFollowAdaptiveBudget(t *testing.T) {
+	sampler := newSubnetSampler([]string{"198.51.100.0/24"})
+	got := hierarchicalCandidateIPs(sampler, []string{"172.66.130.0/24", "104.18.0.0/16"}, nil, nil, 100, 4, candidateBudget{Narrow: 40, Wide: 30, Global: 30})
+	narrow, wide, global := 0, 0, 0
+	narrowPrefix := netip.MustParsePrefix("172.66.130.0/24")
+	widePrefix := netip.MustParsePrefix("104.18.0.0/16")
+	for _, raw := range got {
+		addr := netip.MustParseAddr(raw)
+		switch {
+		case narrowPrefix.Contains(addr):
+			narrow++
+		case widePrefix.Contains(addr):
+			wide++
+		default:
+			global++
+		}
+	}
+	if narrow < 38 || wide < 28 || global < 28 {
+		t.Fatalf("adaptive allocation narrow=%d wide=%d global=%d", narrow, wide, global)
 	}
 }

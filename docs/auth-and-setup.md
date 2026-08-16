@@ -2,7 +2,7 @@
 
 ## 目标
 
-WebUI 会保存 Cloudflare API Token、Zone ID、目标域名、扫描参数，并且后续会执行 DNS 删除和创建操作。因此第一版必须有管理员登录保护。
+WebUI 会保存 Cloudflare API Token 或 Global API Key、Zone ID、多个目标域名、扫描参数，并且后续会执行 DNS 删除和创建操作。因此第一版必须有管理员登录保护。
 
 MVP 不做多用户系统，只做单管理员：
 
@@ -53,13 +53,15 @@ GET /
 
 ## 配置流程
 
-登录后进入配置页面，填写：
+登录后进入配置页面，分别维护“凭据库”与“DNS 目标”：
 
 ```text
-Cloudflare API Token
-Cloudflare Account ID
-Cloudflare Zone ID
-目标完整域名
+凭据名称
+认证类型：API Token / Email + Global API Key
+Cloudflare Account ID（可选）
+目标名称、根域名、Zone ID、目标完整域名
+记录族：IPv4 A / IPv6 AAAA / A + AAAA
+目标引用的凭据
 IPv4 写入数量
 IPv6 写入数量
 协议是否 TLS
@@ -68,7 +70,7 @@ RTT 并发数
 定时运行时间
 ```
 
-Cloudflare API Token 不应在页面上明文回显。编辑时可以留空表示保留旧值。
+API Token 和 Global API Key 都不应在页面上明文回显。编辑时可以留空表示保留已保存的旧值。任务快照只保存凭据 ID，不复制密钥；服务重启后续接时，按稳定 ID 从当前凭据库取密钥。
 
 ## 权限边界
 
@@ -100,7 +102,7 @@ Cloudflare API Token 不应在页面上明文回显。编辑时可以留空表�
 ## 安全原则
 
 - 密码不能明文存储。
-- API Token 不能在 WebUI 明文回显。
+- API Token 和 Global API Key 不能在 WebUI、日志或任务快照中明文回显。
 - 删除 DNS 记录必须只针对配置的完整域名和 A / AAAA 类型。
 - 第一版先不开放公网访问更安全，建议先通过 VPS IP + 非标准端口或 SSH 隧道测试。
 

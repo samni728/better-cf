@@ -1,6 +1,12 @@
 # Better CF
 
+[![Version](https://img.shields.io/badge/version-v1.1.0-2563eb)](VERSION)
+[![GitHub](https://img.shields.io/badge/GitHub-samni728%2Fbetter--cf-111827?logo=github)](https://github.com/samni728/better-cf)
+[![Star](https://img.shields.io/github/stars/samni728/better-cf?style=social)](https://github.com/samni728/better-cf)
+
 Better CF 是一个基于 `better-cloudflare-ip` 的 Cloudflare 优选 IP 自动化项目。
+
+当前 `v1.1.0` 已把 WebUI 拆成执行中心、任务历史、IP 结果和项目配置四个工作区，并新增可管理的 SQLite 搜寻记忆：真连接成功会从具体 IP 逐级扩展到 `/24`、父 `/16` 和全局池；近期失败 IP/网段会跨任务冷却，候选预算会按历史成功率自动调整。
 
 它的目标是：在当前 VPS / 本地网络环境中定期扫描速度更好的 Cloudflare IPv4 / IPv6 IP，保存测速结果，再把最终选出的 IP 批量同步到你自己的 Cloudflare 域名解析中。这样客户端只需要使用你的自定义优选域名，就能使用最新一轮筛选出来的 Cloudflare 优选 IP。
 
@@ -53,6 +59,17 @@ Better CF 是一个基于 `better-cloudflare-ip` 的 Cloudflare 优选 IP 自动
 
 当前执行逻辑会按任务串行收集结果，避免多个测速任务并发影响真实带宽表现。候选 IP 先进行一次快速 HTTPS 响应和 `CF-RAY` 机房检测；通过后在下载测速前后各执行 3 次 TCP RTT 采样。任意一次超过最大 RTT 都会被淘汰，最终页面显示两轮中较差的平均 RTT。
 
+可选的“真连接测试”位于原有 RTT / 带宽筛选之后。它不是再次测速，而是把候选 IP 写入用户提供的 `vmess://` 或 `vless://` 节点模板，通过临时 Xray HTTP 代理访问指定测试 URL：
+
+- IPv4 与 IPv6 可以分别启用。
+- HTTP / 非 TLS 与 HTTPS / TLS 可以分别启用，并分别要求一条匹配的节点模板。
+- HTTP 完整检查 `80, 8080, 8880, 2052, 2082, 2086, 2095`。
+- HTTPS 完整检查 `443, 2053, 2083, 2087, 2096, 8443`。
+- 一个候选只要有一个所选端口真正返回 HTTP `2xx/3xx` 就能入选；系统仍会完成整个端口组并记录所有可用端口及各自响应延迟。
+- 节点分享链接含 UUID 等敏感信息，只保存在当前 Settings，不复制到任务日志或任务配置快照。
+
+启用此功能时，VPS 需要安装官方 Xray-core，并可通过 `XRAY_BIN` 指定路径；默认也会查找 `/root/cf-betterip/xray`。
+
 地区模式的含义：
 
 - 全局随机：下方保留的地区值不参与筛选，从全球 IP 池随机抽取。
@@ -65,27 +82,39 @@ Better CF 是一个基于 `better-cloudflare-ip` 的 Cloudflare 优选 IP 自动
 
 ### 2. Cloudflare DNS 自动同步
 
-扫描达到目标数量后，系统会一次性同步到 Cloudflare：
+扫描达到目标数量后，系统会把同一轮入选结果分发到所有已启用 DNS 目标：
 
-- IPv4 写入 A 记录
-- IPv6 写入 AAAA 记录
-- 支持单域名模式：IPv4 和 IPv6 都写到同一个域名
-- 支持分离域名模式：IPv4 和 IPv6 分别写到不同域名
-- 支持统一 Cloudflare Token / Zone ID
-- 支持 IPv4 / IPv6 使用独立 Token / Zone ID
+- 凭据库可以新增、编辑和删除多组 Cloudflare 凭据。
+- 每组凭据可选 `API Token` 或 `Email + Global API Key`。
+- DNS 目标可以新增、编辑、停用和删除，包含显示名称、根域名、Zone ID、完整域名、`ipv4` / `ipv6` / `both` 以及引用的凭据 ID。
+- `ipv4` 目标只写 A，`ipv6` 目标只写 AAAA，`both` 目标同时写 A 和 AAAA。
+- 一次扫描只测一份 IPv4 / IPv6 结果，不会因目标数量增加而重复测速；DNS 阶段再 fan-out 到多个目标。
 
-同步时只会操作配置中指定域名下对应类型的 DNS 记录，不会删除其他域名或其他记录类型。
+同步时只会操作目标所引用 Zone ID 内、完整域名与记录类型都精确匹配的 DNS 记录，不会删除其他域名或其他记录类型。
 
-### 3. 先清空后更新
+旧版“单域名 / IPv4 与 IPv6 分离”配置会在首次读取时自动迁移成凭据库和 DNS 目标列表，无需手工重建配置。
+
+### 2.1 独立手动 DNS 目标
+
+配置页可以另外添加“手动 DNS 目标”。它们不参与自动扫描、定时任务或 auto update，只在管理员手动操作时更改 Cloudflare DNS。
+
+- 可混合粘贴合计最多 500 个 `vmess://` / `vless://` 分享链接，输入框会实时显示已识别的唯一 IPv4 / IPv6 数量。
+- vmess 只读取 JSON 的 `add`，vless 只读取 URL 的服务器地址；两者都只接受真实 IPv4 / IPv6 字面量，不使用节点名称、Host、SNI、备注、端口或 UUID。
+- IP 规范化并去重后，完整替换该完整域名的 A / AAAA 集合。
+- “清空”只删除该完整域名的 A / AAAA，保留手动目标配置；“清空并删除目标”会在 Cloudflare 清理成功后再移除本地配置。
+- 手动目标不允许与自动 DNS 目标重复，防止定时任务覆盖手动结果。
+
+### 3. 安全替换：先创建、后删除
 
 每次同步时，系统会：
 
-1. 查询指定域名已有的 A / AAAA 记录。
-2. 删除旧记录。
-3. 创建本轮扫描得到的新记录。
-4. 再次从 Cloudflare 查询确认写入结果。
+1. 按目标查询已有的 A / AAAA 记录。
+2. 计算需要保留、创建和删除的差集。
+3. 先创建缺失的新记录；任何创建失败时，该目标不删除旧记录。
+4. 新记录创建成功后，再删除不在本轮目标集合中的过期记录。
+5. 再次从 Cloudflare 查询，确认每个目标的实际记录与应写集合一致。
 
-这样可以保证域名解析中的 IP 始终是最新一轮的优选结果，而不是不断追加旧 IP。
+这样既不会无限追加旧 IP，也不会在新记录尚未创建成功时先清空可用解析。
 
 ### 4. WebUI 看板
 
@@ -93,7 +122,7 @@ WebUI 当前包含：
 
 - 当前同步状态
 - 今日更新 IP 数量
-- 今日写入 DNS 数量
+- 今日写入 DNS 记录数量（按目标 fan-out 后累计）
 - 今日任务数量
 - DNS 同步状态
 - 最近一次执行进度
@@ -182,7 +211,7 @@ database/local-ip-ranges.csv
 
 文件每行字段为 `CIDR, 国家, 区域代码, 城市`。首次启动会复制到 `data/local-ip-ranges.csv`；之后可在 WebUI 中更新。注意：这份 GeoFeed 快照是地理数据参考，不是 better-cloudflare-ip 的可测 CDN 地址池；实际扫描候选来自 `ips-v4.txt / ips-v6.txt`，地区判定来自 `CF-RAY + locations.json`。
 
-该目录包含管理员账号哈希、Cloudflare Token、任务历史和测速结果，不应该提交到 Git。
+该目录包含管理员账号哈希、Cloudflare API Token / Global API Key、任务历史和测速结果，不应该提交到 Git。
 
 ## Docker Compose 启动
 
@@ -318,16 +347,15 @@ http://服务器IP:18080
 
 在 WebUI 中填写：
 
-- Cloudflare API Token
-- Zone ID
-- 目标域名
+- 一组或多组 Cloudflare 凭据：API Token，或 Email + Global API Key
+- 一个或多个 DNS 目标：名称、根域名、Zone ID、完整域名、记录族、凭据
 - IPv4 / IPv6 数量
 - 地区筛选模式、国家、区域/数据中心代码和城市
 - 带宽目标
 - RTT 测试进程数
 - 定时策略
 
-保存后可以先点击“测试 Cloudflare 写入”，系统会创建并删除一个临时 TXT 记录，用于确认配置是否可用。
+保存后可以按 DNS 目标测试 Cloudflare 写入，系统会使用该目标引用的凭据创建并删除一个临时 TXT 记录，用于确认凭据、Zone 和 DNS 写入权限是否可用。
 
 ## 安全说明
 
@@ -338,7 +366,7 @@ http://服务器IP:18080
 - `logs/`
 - `bin/`
 - `.env`
-- Cloudflare Token
+- Cloudflare API Token / Global API Key
 - VPS 密码
 - 管理员账号数据
 

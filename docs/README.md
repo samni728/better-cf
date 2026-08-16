@@ -16,7 +16,7 @@
 - [数据模型](data-model.md)：SQLite 表结构草案、历史追踪、IP 长期画像。
 - [WebUI 工作流](webui-workflows.md)：页面、配置项、用户操作路径。
 - [实施路线图](implementation-plan.md)：从 CLI 重构到 WebUI、Docker、定时任务的阶段计划。
-- [同步策略](sync-policy.md)：以 VPS 项目为主，本地目录作为同步副本的工作方式。
+- [同步策略](sync-policy.md)：以 Mac 本地为唯一源码源，单向发布到 GitHub 和 213 VPS。
 
 ## 当前源码状态
 
@@ -26,7 +26,7 @@
 /root/cf-betterip/source
 ```
 
-当前本地目录作为远端源码的同步副本。默认协作规则是：先以 VPS 上的 `/root/cf-betterip/source` 为主，再从 VPS 同步到本地当前目录。
+当前 Mac 目录是唯一开发源。VPS 上的 `/root/cf-betterip/source` 是运行副本，只能从 Mac 单向更新，不得反向覆盖本地代码。
 
 当前上游仓库：
 

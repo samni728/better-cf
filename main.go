@@ -188,9 +188,21 @@ func cloudflareTest(ipType int, useTLS bool, taskNum int, speed int, maxRTTMs in
 		fmt.Printf("已从历史成功结果提取 %d 个 IPv%d 优先子网，每轮会先从这些子网生成新 IP。\n", len(hintSubnets), ipType)
 	}
 	historyIPs := hintIPsFromEnv(ipType)
+	budget := candidateBudgetFromEnv()
+	excludeIPs := ipSetFromEnv("BETTER_CF_EXCLUDE_IPS", ipType)
+	excludePrefixes := prefixListFromEnv("BETTER_CF_EXCLUDE_SUBNETS", ipType)
+	if len(excludeIPs) > 0 || len(excludePrefixes) > 0 {
+		fmt.Printf("搜索记忆冷却生效：跳过 %d 个近期失败 IP、%d 个近期失败网段。\n", len(excludeIPs), len(excludePrefixes))
+	}
 	if len(historyIPs) > 0 {
+		historyIPs = filterCandidateIPs(historyIPs, excludeIPs, excludePrefixes)
+		exactLimit := maxInt(1, 100*budget.Exact/100)
+		if len(historyIPs) > exactLimit {
+			historyIPs = historyIPs[:exactLimit]
+		}
 		fmt.Printf("已加载 %d 个同地区历史成功 IPv%d，先按当前 RTT、带宽和 CF-RAY 条件重测。\n", len(historyIPs), ipType)
 	}
+	fmt.Printf("自适应候选预算：历史精确 %d%%、窄网段 %d%%、父网段 %d%%、全局探索 %d%%。\n", budget.Exact, budget.Narrow, budget.Wide, budget.Global)
 	subnetSampler := newSubnetSampler(ipList)
 
 	sampleSize := 100
@@ -215,12 +227,7 @@ func cloudflareTest(ipType int, useTLS bool, taskNum int, speed int, maxRTTMs in
 				testIPs = append([]string(nil), historyIPs...)
 				fmt.Printf("正在优先复测 %d 个历史成功 IP...\n", len(testIPs))
 			} else {
-				sampled := candidateSubnets(subnetSampler, hintSubnets, sampleSize)
-				if ipType == 6 {
-					testIPs = getRandomIPv6s(sampled)
-				} else {
-					testIPs = getRandomIPv4s(sampled)
-				}
+				testIPs = hierarchicalCandidateIPs(subnetSampler, hintSubnets, excludeIPs, excludePrefixes, sampleSize, ipType, budget)
 				fmt.Printf("已从原版地址池生成 %d 个候选 IP，先进行快速响应和机房检测...\n", len(testIPs))
 			}
 
@@ -311,6 +318,34 @@ type subnetSampler struct {
 	cursor int
 }
 
+type candidateBudget struct {
+	Exact  int
+	Narrow int
+	Wide   int
+	Global int
+}
+
+func candidateBudgetFromEnv() candidateBudget {
+	budget := candidateBudget{
+		Exact:  envInt("BETTER_CF_BUDGET_EXACT", 15),
+		Narrow: envInt("BETTER_CF_BUDGET_NARROW", 30),
+		Wide:   envInt("BETTER_CF_BUDGET_WIDE", 20),
+		Global: envInt("BETTER_CF_BUDGET_GLOBAL", 35),
+	}
+	if budget.Exact < 0 || budget.Narrow < 0 || budget.Wide < 0 || budget.Global < 0 || budget.Exact+budget.Narrow+budget.Wide+budget.Global != 100 {
+		return candidateBudget{Exact: 15, Narrow: 30, Wide: 20, Global: 35}
+	}
+	return budget
+}
+
+func envInt(name string, fallback int) int {
+	value, err := strconv.Atoi(strings.TrimSpace(os.Getenv(name)))
+	if err != nil {
+		return fallback
+	}
+	return value
+}
+
 func newSubnetSampler(list []string) *subnetSampler {
 	s := &subnetSampler{list: append([]string(nil), list...)}
 	s.reshuffle()
@@ -382,6 +417,178 @@ func candidateSubnets(sampler *subnetSampler, hints []string, sampleSize int) []
 			}
 			seen[subnet] = true
 			result = append(result, subnet)
+		}
+	}
+	return result
+}
+
+// hierarchicalCandidateIPs 将一半预算用于成功网段的利用/父网段探索，另一半用于全局新网段。
+// IPv4 hint 可同时包含 /24 和 /16；同一 /16 会随机落到不同 /24，找到成功后再由 /24 深挖。
+func hierarchicalCandidateIPs(sampler *subnetSampler, hints []string, excludeIPs map[string]bool, excludePrefixes []netip.Prefix, sampleSize, ipType int, budget candidateBudget) []string {
+	if sampleSize <= 0 {
+		return nil
+	}
+	result := make([]string, 0, sampleSize)
+	seen := make(map[string]bool, sampleSize)
+	add := func(ip string) {
+		if ip == "" || seen[ip] || excludeIPs[ip] {
+			return
+		}
+		addr, err := netip.ParseAddr(ip)
+		if err != nil {
+			return
+		}
+		for _, prefix := range excludePrefixes {
+			if prefix.Contains(addr) {
+				return
+			}
+		}
+		seen[ip] = true
+		result = append(result, ip)
+	}
+
+	generatedBudget := budget.Narrow + budget.Wide + budget.Global
+	if generatedBudget <= 0 {
+		generatedBudget = 1
+	}
+	narrowTarget := sampleSize * budget.Narrow / generatedBudget
+	wideTarget := narrowTarget + sampleSize*budget.Wide/generatedBudget
+	var narrowHints, wideHints []string
+	for _, raw := range hints {
+		prefix, err := netip.ParsePrefix(strings.TrimSpace(raw))
+		if err != nil || (ipType == 4) != prefix.Addr().Is4() {
+			continue
+		}
+		narrowBits := 48
+		if ipType == 4 {
+			narrowBits = 24
+		}
+		if prefix.Bits() >= narrowBits {
+			narrowHints = append(narrowHints, prefix.Masked().String())
+		} else {
+			wideHints = append(wideHints, prefix.Masked().String())
+		}
+	}
+	if len(narrowHints) == 0 {
+		narrowTarget = 0
+	}
+	activeNarrow := randomSample(narrowHints, minInt(len(narrowHints), 20))
+	for attempts := 0; len(result) < narrowTarget && len(activeNarrow) > 0 && attempts < maxInt(1, narrowTarget*20); attempts++ {
+		add(randomIPFromPrefix(activeNarrow[attempts%len(activeNarrow)], ipType))
+	}
+	activeWide := randomSample(wideHints, minInt(len(wideHints), 20))
+	for attempts := 0; len(result) < wideTarget && len(activeWide) > 0 && attempts < maxInt(1, wideTarget*20); attempts++ {
+		add(randomIPFromPrefix(activeWide[attempts%len(activeWide)], ipType))
+	}
+	// 只有窄网段线索时继续在成功邻域深挖，不会因为没有父网段而浪费历史预算。
+	for attempts := 0; len(result) < wideTarget && len(activeNarrow) > 0 && attempts < maxInt(1, wideTarget*20); attempts++ {
+		add(randomIPFromPrefix(activeNarrow[attempts%len(activeNarrow)], ipType))
+	}
+	for attempts := 0; len(result) < sampleSize && attempts < sampleSize*20; attempts++ {
+		batch := sampler.Next(1)
+		if len(batch) == 0 {
+			break
+		}
+		add(randomIPFromPrefix(batch[0], ipType))
+	}
+	return result
+}
+
+func randomIPFromPrefix(raw string, ipType int) string {
+	raw = strings.TrimSpace(raw)
+	prefix, err := netip.ParsePrefix(raw)
+	if err != nil {
+		addr, addrErr := netip.ParseAddr(strings.Split(raw, "/")[0])
+		if addrErr != nil {
+			return ""
+		}
+		bits := 48
+		if ipType == 4 {
+			bits = 24
+		}
+		prefix = netip.PrefixFrom(addr, bits)
+	}
+	prefix = prefix.Masked()
+	if (ipType == 4) != prefix.Addr().Is4() {
+		return ""
+	}
+	if ipType == 4 {
+		base := prefix.Addr().As4()
+		value := uint32(base[0])<<24 | uint32(base[1])<<16 | uint32(base[2])<<8 | uint32(base[3])
+		hostBits := 32 - prefix.Bits()
+		if hostBits > 30 {
+			hostBits = 30
+		}
+		if hostBits > 0 {
+			value += uint32(nextRandomIntn(1 << hostBits))
+		}
+		return netip.AddrFrom4([4]byte{byte(value >> 24), byte(value >> 16), byte(value >> 8), byte(value)}).String()
+	}
+	base := prefix.Addr().As16()
+	hostBits := 128 - prefix.Bits()
+	for i := 15; i >= 0 && hostBits > 0; i-- {
+		bits := 8
+		if hostBits < bits {
+			bits = hostBits
+		}
+		mask := byte((1 << bits) - 1)
+		base[i] = (base[i] &^ mask) | byte(nextRandomIntn(1<<bits))
+		hostBits -= bits
+	}
+	return netip.AddrFrom16(base).String()
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func ipSetFromEnv(name string, ipType int) map[string]bool {
+	raw := strings.TrimSpace(os.Getenv(name))
+	result := make(map[string]bool)
+	for _, item := range strings.FieldsFunc(raw, envListSeparator) {
+		addr, err := netip.ParseAddr(strings.TrimSpace(item))
+		if err == nil && (ipType == 4) == addr.Is4() {
+			result[addr.String()] = true
+		}
+	}
+	return result
+}
+
+func prefixListFromEnv(name string, ipType int) []netip.Prefix {
+	raw := strings.TrimSpace(os.Getenv(name))
+	var result []netip.Prefix
+	for _, item := range strings.FieldsFunc(raw, envListSeparator) {
+		prefix, err := netip.ParsePrefix(strings.TrimSpace(item))
+		if err == nil && (ipType == 4) == prefix.Addr().Is4() {
+			result = append(result, prefix.Masked())
+		}
+	}
+	return result
+}
+
+func envListSeparator(r rune) bool {
+	return r == ',' || r == ';' || r == '\n' || r == '\r' || r == ' ' || r == '\t'
+}
+
+func filterCandidateIPs(values []string, excludes map[string]bool, prefixes []netip.Prefix) []string {
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		addr, err := netip.ParseAddr(value)
+		if err != nil || excludes[addr.String()] {
+			continue
+		}
+		blocked := false
+		for _, prefix := range prefixes {
+			if prefix.Contains(addr) {
+				blocked = true
+				break
+			}
+		}
+		if !blocked {
+			result = append(result, addr.String())
 		}
 	}
 	return result
