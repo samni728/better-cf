@@ -45,7 +45,7 @@ type App struct {
 }
 
 const (
-	appVersion               = "v1.3.3"
+	appVersion               = "v1.3.4"
 	repositoryURL            = "https://github.com/samni728/better-cf"
 	scannerObservationPrefix = "@@BETTER_CF_OBSERVATION@@"
 )

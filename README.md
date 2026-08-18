@@ -1,12 +1,12 @@
 # Better CF
 
-[![Version](https://img.shields.io/badge/version-v1.3.3-2563eb)](VERSION)
+[![Version](https://img.shields.io/badge/version-v1.3.4-2563eb)](VERSION)
 [![GitHub](https://img.shields.io/badge/GitHub-samni728%2Fbetter--cf-111827?logo=github)](https://github.com/samni728/better-cf)
 [![Star](https://img.shields.io/github/stars/samni728/better-cf?style=social)](https://github.com/samni728/better-cf)
 
 Better CF 是一个基于 `better-cloudflare-ip` 的 Cloudflare 优选 IP 自动化项目。
 
-当前 `v1.3.3` 已把 WebUI 拆成执行中心、任务历史、IP 结果和项目配置四个工作区，并新增分阶段 SQLite 搜寻记忆。IPv4 与 IPv6 分别冻结候选来源、地区条件和真连接开关：某个协议族设置手动范围后，该协议族每批 100% 候选来自手动范围并暂停历史库存、全局池和地区过滤；另一个协议族仍保持自己的库存、地区与真连接策略。RTT 和带宽始终作为质量准入条件。
+当前 `v1.3.4` 已把 WebUI 拆成执行中心、任务历史、IP 结果和项目配置四个工作区，并新增分阶段 SQLite 搜寻记忆。IPv4 与 IPv6 分别冻结候选来源、地区条件和真连接开关：某个协议族设置手动范围后，该协议族每批 100% 候选来自手动范围并暂停历史库存、全局池和地区过滤；另一个协议族仍保持自己的库存、地区与真连接策略。RTT 和带宽始终作为质量准入条件。
 
 它的目标是：在当前 VPS / 本地网络环境中定期扫描速度更好的 Cloudflare IPv4 / IPv6 IP，保存测速结果，再把最终选出的 IP 批量同步到你自己的 Cloudflare 域名解析中。这样客户端只需要使用你的自定义优选域名，就能使用最新一轮筛选出来的 Cloudflare 优选 IP。
 
@@ -331,6 +331,24 @@ go run ./cmd/cf-betterip-web --listen 0.0.0.0:18080 --data-dir ./data
 ```bash
 ./scripts/run-web.sh
 ```
+
+在已经部署好 `bin/cf-betterip-web` 的服务器项目目录中，也可以使用中文管理菜单：
+
+```bash
+./manage.sh
+```
+
+菜单包含启动、停止、重启、实时日志和运行状态。也可以直接执行对应命令：
+
+```bash
+./manage.sh start
+./manage.sh stop
+./manage.sh restart
+./manage.sh log
+./manage.sh status
+```
+
+默认沿用项目目录中的 `data/`、`web.log`、`web.pid` 和监听端口 `18080`；需要临时调整时可通过 `LISTEN_ADDR`、`DATA_DIR`、`LOG_FILE`、`PID_FILE` 环境变量覆盖。
 
 访问：
 
