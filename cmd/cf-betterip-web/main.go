@@ -45,7 +45,7 @@ type App struct {
 }
 
 const (
-	appVersion               = "v1.3.4"
+	appVersion               = "v1.3.5"
 	repositoryURL            = "https://github.com/samni728/better-cf"
 	scannerObservationPrefix = "@@BETTER_CF_OBSERVATION@@"
 )
@@ -76,37 +76,39 @@ type Settings struct {
 	DNSTargets            []DNSTargetConfig            `json:"dns_targets,omitempty"`
 	ManualDNSTargets      []ManualDNSTargetConfig      `json:"manual_dns_targets,omitempty"`
 	// Legacy DNS fields are retained for one-way v1 -> v2 migration only.
-	CloudflareAPIToken      string       `json:"cloudflare_api_token,omitempty"`
-	CloudflareAccountID     string       `json:"cloudflare_account_id,omitempty"`
-	CloudflareZoneID        string       `json:"cloudflare_zone_id,omitempty"`
-	RecordName              string       `json:"record_name,omitempty"`
-	DNSTargetMode           string       `json:"dns_target_mode,omitempty"`
-	IPv4Target              TargetConfig `json:"ipv4_target"`
-	IPv6Target              TargetConfig `json:"ipv6_target"`
-	IPv4Enabled             bool         `json:"ipv4_enabled"`
-	IPv6Enabled             bool         `json:"ipv6_enabled"`
-	IPv4Count               int          `json:"ipv4_count"`
-	IPv6Count               int          `json:"ipv6_count"`
-	UseTLS                  bool         `json:"use_tls"`
-	BandwidthMbps           int          `json:"bandwidth_mbps"`
-	RTTConcurrency          int          `json:"rtt_concurrency"`
-	MaxRTTMs                int          `json:"max_rtt_ms"`
-	TrueConnectionIPv4      bool         `json:"true_connection_ipv4,omitempty"`
-	TrueConnectionIPv6      bool         `json:"true_connection_ipv6,omitempty"`
-	TrueConnectionHTTP      bool         `json:"true_connection_http,omitempty"`
-	TrueConnectionHTTPS     bool         `json:"true_connection_https,omitempty"`
-	TrueConnectionHTTPNode  string       `json:"true_connection_http_node,omitempty"`
-	TrueConnectionHTTPSNode string       `json:"true_connection_https_node,omitempty"`
-	TrueConnectionTestURL   string       `json:"true_connection_test_url,omitempty"`
-	SearchNetworkLabel      string       `json:"search_network_label,omitempty"`
-	LocationMode            string       `json:"location_mode,omitempty"`
-	LocationCountry         string       `json:"location_country,omitempty"`
-	LocationRegion          string       `json:"location_region,omitempty"`
-	LocationCity            string       `json:"location_city,omitempty"`
-	ScheduleEnabled         bool         `json:"schedule_enabled"`
-	ScheduleMode            string       `json:"schedule_mode,omitempty"`
-	ScheduleIntervalDays    int          `json:"schedule_interval_days"`
-	ScheduleTime            string       `json:"schedule_time,omitempty"`
+	CloudflareAPIToken       string       `json:"cloudflare_api_token,omitempty"`
+	CloudflareAccountID      string       `json:"cloudflare_account_id,omitempty"`
+	CloudflareZoneID         string       `json:"cloudflare_zone_id,omitempty"`
+	RecordName               string       `json:"record_name,omitempty"`
+	DNSTargetMode            string       `json:"dns_target_mode,omitempty"`
+	IPv4Target               TargetConfig `json:"ipv4_target"`
+	IPv6Target               TargetConfig `json:"ipv6_target"`
+	IPv4Enabled              bool         `json:"ipv4_enabled"`
+	IPv6Enabled              bool         `json:"ipv6_enabled"`
+	IPv4Count                int          `json:"ipv4_count"`
+	IPv6Count                int          `json:"ipv6_count"`
+	UseTLS                   bool         `json:"use_tls"`
+	BandwidthMbps            int          `json:"bandwidth_mbps"`
+	RTTConcurrency           int          `json:"rtt_concurrency"`
+	MaxRTTMs                 int          `json:"max_rtt_ms"`
+	TrueConnectionIPv4       bool         `json:"true_connection_ipv4,omitempty"`
+	TrueConnectionIPv6       bool         `json:"true_connection_ipv6,omitempty"`
+	TrueConnectionHTTP       bool         `json:"true_connection_http,omitempty"`
+	TrueConnectionHTTPS      bool         `json:"true_connection_https,omitempty"`
+	TrueConnectionHTTPPorts  []int        `json:"true_connection_http_ports"`
+	TrueConnectionHTTPSPorts []int        `json:"true_connection_https_ports"`
+	TrueConnectionHTTPNode   string       `json:"true_connection_http_node,omitempty"`
+	TrueConnectionHTTPSNode  string       `json:"true_connection_https_node,omitempty"`
+	TrueConnectionTestURL    string       `json:"true_connection_test_url,omitempty"`
+	SearchNetworkLabel       string       `json:"search_network_label,omitempty"`
+	LocationMode             string       `json:"location_mode,omitempty"`
+	LocationCountry          string       `json:"location_country,omitempty"`
+	LocationRegion           string       `json:"location_region,omitempty"`
+	LocationCity             string       `json:"location_city,omitempty"`
+	ScheduleEnabled          bool         `json:"schedule_enabled"`
+	ScheduleMode             string       `json:"schedule_mode,omitempty"`
+	ScheduleIntervalDays     int          `json:"schedule_interval_days"`
+	ScheduleTime             string       `json:"schedule_time,omitempty"`
 }
 
 type CloudflareCredentialConfig struct {
@@ -285,46 +287,53 @@ type TrueConnectionPortResult struct {
 	LatencyMs int    `json:"latency_ms"`
 }
 
+type TrueConnectionPortChoice struct {
+	Port    int
+	Checked bool
+}
+
 type PageData struct {
-	Title                  string
-	Flash                  string
-	Error                  string
-	Username               string
-	Settings               Settings
-	HasAdmin               bool
-	CloudflareCredentials  []CloudflareCredentialView
-	DNSTargets             []DNSTargetView
-	ManualDNSTargets       []ManualDNSTargetView
-	DNSTargetSummary       string
-	ExpectedDNSRecordCount int
-	ScheduleSummary        string
-	LocationSummary        string
-	NextRunAt              string
-	RecentRuns             []RunRecord
-	HasRunningRun          bool
-	Stats                  DashboardStats
-	CurrentRun             *RunRecord
-	LatestRun              *RunRecord
-	ConfigTestResults      []ConfigTestResult
-	CanResumeRun           bool
-	LatestResultSummary    IPResultSummary
-	LatestIPv4Results      []IPResultView
-	LatestIPv6Results      []IPResultView
-	TodayResultSummary     IPResultSummary
-	TodayIPv4Results       []IPResultView
-	TodayIPv6Results       []IPResultView
-	GeoCountries           []GeoChoice
-	GeoRegions             []GeoChoice
-	GeoCities              []GeoChoice
-	GeoLocations           []GeoLocation
-	GeoDatabase            GeoDatabaseStatus
-	GeoFilterStats         GeoFilterStats
-	FamilyNoResultLimit    string
-	SearchMemoryIPv4       searchmemory.Summary
-	SearchMemoryIPv6       searchmemory.Summary
-	SearchMemoryProfiles   []SearchMemoryProfileView
-	AppVersion             string
-	RepositoryURL          string
+	Title                          string
+	Flash                          string
+	Error                          string
+	Username                       string
+	Settings                       Settings
+	TrueConnectionHTTPPortChoices  []TrueConnectionPortChoice
+	TrueConnectionHTTPSPortChoices []TrueConnectionPortChoice
+	HasAdmin                       bool
+	CloudflareCredentials          []CloudflareCredentialView
+	DNSTargets                     []DNSTargetView
+	ManualDNSTargets               []ManualDNSTargetView
+	DNSTargetSummary               string
+	ExpectedDNSRecordCount         int
+	ScheduleSummary                string
+	LocationSummary                string
+	NextRunAt                      string
+	RecentRuns                     []RunRecord
+	HasRunningRun                  bool
+	Stats                          DashboardStats
+	CurrentRun                     *RunRecord
+	LatestRun                      *RunRecord
+	ConfigTestResults              []ConfigTestResult
+	CanResumeRun                   bool
+	LatestResultSummary            IPResultSummary
+	LatestIPv4Results              []IPResultView
+	LatestIPv6Results              []IPResultView
+	TodayResultSummary             IPResultSummary
+	TodayIPv4Results               []IPResultView
+	TodayIPv6Results               []IPResultView
+	GeoCountries                   []GeoChoice
+	GeoRegions                     []GeoChoice
+	GeoCities                      []GeoChoice
+	GeoLocations                   []GeoLocation
+	GeoDatabase                    GeoDatabaseStatus
+	GeoFilterStats                 GeoFilterStats
+	FamilyNoResultLimit            string
+	SearchMemoryIPv4               searchmemory.Summary
+	SearchMemoryIPv6               searchmemory.Summary
+	SearchMemoryProfiles           []SearchMemoryProfileView
+	AppVersion                     string
+	RepositoryURL                  string
 }
 
 type SearchMemoryProfileView struct {
@@ -984,6 +993,12 @@ func cloneSettings(settings Settings) Settings {
 	cloned.CloudflareCredentials = append([]CloudflareCredentialConfig(nil), settings.CloudflareCredentials...)
 	cloned.DNSTargets = append([]DNSTargetConfig(nil), settings.DNSTargets...)
 	cloned.ManualDNSTargets = append([]ManualDNSTargetConfig(nil), settings.ManualDNSTargets...)
+	if settings.TrueConnectionHTTPPorts != nil {
+		cloned.TrueConnectionHTTPPorts = append([]int{}, settings.TrueConnectionHTTPPorts...)
+	}
+	if settings.TrueConnectionHTTPSPorts != nil {
+		cloned.TrueConnectionHTTPSPorts = append([]int{}, settings.TrueConnectionHTTPSPorts...)
+	}
 	return cloned
 }
 
@@ -1603,16 +1618,29 @@ func trueConnectionPlanText(settings Settings) string {
 	}
 	var protocols []string
 	if settings.TrueConnectionHTTP {
-		protocols = append(protocols, "HTTP（7 个端口）")
+		protocols = append(protocols, trueConnectionPortPlanText("HTTP", settings.TrueConnectionHTTPPorts, trueConnectionHTTPPorts))
 	}
 	if settings.TrueConnectionHTTPS {
-		protocols = append(protocols, "HTTPS（6 个端口）")
+		protocols = append(protocols, trueConnectionPortPlanText("HTTPS", settings.TrueConnectionHTTPSPorts, trueConnectionHTTPSPorts))
 	}
 	familyText := strings.Join(families, " + ")
 	if len(families) == 1 {
 		familyText = "仅 " + familyText
 	}
 	return familyText + "；" + strings.Join(protocols, " + ")
+}
+
+func trueConnectionPortList(selected, supported []int) string {
+	ports := effectiveTrueConnectionPorts(selected, supported)
+	parts := make([]string, 0, len(ports))
+	for _, port := range ports {
+		parts = append(parts, strconv.Itoa(port))
+	}
+	return strings.Join(parts, "、")
+}
+
+func trueConnectionPortPlanText(scheme string, selected, supported []int) string {
+	return scheme + "（" + trueConnectionPortList(selected, supported) + "）"
 }
 
 func (s *Store) saveLocked() error {
@@ -2105,23 +2133,25 @@ func (a *App) pageData(title, username string, settings Settings) PageData {
 	geoLocations, geoDatabase := a.geoSnapshot()
 	geoStats := calculateGeoFilterStats(geoLocations, settings)
 	data := PageData{
-		Title:                  title,
-		Username:               username,
-		Settings:               settings,
-		CloudflareCredentials:  buildCredentialViews(settings),
-		DNSTargets:             buildDNSTargetViews(settings),
-		ManualDNSTargets:       buildManualDNSTargetViews(settings),
-		DNSTargetSummary:       dnsTargetSummary(settings),
-		ExpectedDNSRecordCount: requiredDNSRecordCount(settings),
-		ScheduleSummary:        scheduleSummary(settings),
-		LocationSummary:        locationFilterSummaryWithStats(settings, geoStats),
-		NextRunAt:              nextRunText(settings),
-		GeoLocations:           geoLocations,
-		GeoDatabase:            geoDatabase,
-		GeoFilterStats:         geoStats,
-		FamilyNoResultLimit:    formatDuration(familyNoResultTimeout()),
-		AppVersion:             appVersion,
-		RepositoryURL:          repositoryURL,
+		Title:                          title,
+		Username:                       username,
+		Settings:                       settings,
+		TrueConnectionHTTPPortChoices:  trueConnectionPortChoices(settings.TrueConnectionHTTPPorts, trueConnectionHTTPPorts),
+		TrueConnectionHTTPSPortChoices: trueConnectionPortChoices(settings.TrueConnectionHTTPSPorts, trueConnectionHTTPSPorts),
+		CloudflareCredentials:          buildCredentialViews(settings),
+		DNSTargets:                     buildDNSTargetViews(settings),
+		ManualDNSTargets:               buildManualDNSTargetViews(settings),
+		DNSTargetSummary:               dnsTargetSummary(settings),
+		ExpectedDNSRecordCount:         requiredDNSRecordCount(settings),
+		ScheduleSummary:                scheduleSummary(settings),
+		LocationSummary:                locationFilterSummaryWithStats(settings, geoStats),
+		NextRunAt:                      nextRunText(settings),
+		GeoLocations:                   geoLocations,
+		GeoDatabase:                    geoDatabase,
+		GeoFilterStats:                 geoStats,
+		FamilyNoResultLimit:            formatDuration(familyNoResultTimeout()),
+		AppVersion:                     appVersion,
+		RepositoryURL:                  repositoryURL,
 	}
 	data.GeoCountries, data.GeoRegions, data.GeoCities = buildGeoChoices(geoLocations, settings)
 	if a.searchMemory != nil {
@@ -2155,11 +2185,11 @@ func (a *App) searchMemoryProfileViews(settings Settings, now time.Time) []Searc
 	for _, insight := range insights {
 		protocols := "基础扫描"
 		if insight.Profile.HTTPEnabled && insight.Profile.HTTPSEnabled {
-			protocols = "HTTP + HTTPS"
+			protocols = fmt.Sprintf("HTTP（%s） + HTTPS（%s）", searchProfilePortLabel(insight.Profile.HTTPPortSelection), searchProfilePortLabel(insight.Profile.HTTPSPortSelection))
 		} else if insight.Profile.HTTPEnabled {
-			protocols = "仅 HTTP"
+			protocols = fmt.Sprintf("仅 HTTP（%s）", searchProfilePortLabel(insight.Profile.HTTPPortSelection))
 		} else if insight.Profile.HTTPSEnabled {
-			protocols = "仅 HTTPS"
+			protocols = fmt.Sprintf("仅 HTTPS（%s）", searchProfilePortLabel(insight.Profile.HTTPSPortSelection))
 		}
 		location := strings.ToUpper(strings.TrimSpace(insight.Profile.Country))
 		if location == "" {
@@ -2181,6 +2211,13 @@ func (a *App) searchMemoryProfileViews(settings Settings, now time.Time) []Searc
 		return views[i].Insight.LastUsedAt > views[j].Insight.LastUsedAt
 	})
 	return views
+}
+
+func searchProfilePortLabel(selection string) string {
+	if strings.TrimSpace(selection) == "" {
+		return "全端口"
+	}
+	return selection
 }
 
 func (a *App) refreshGeoDatabase(w http.ResponseWriter, r *http.Request) {
@@ -2299,6 +2336,13 @@ func (a *App) settings(w http.ResponseWriter, r *http.Request) {
 		next.TrueConnectionIPv6 = r.FormValue("true_connection_ipv6") == "on"
 		next.TrueConnectionHTTP = r.FormValue("true_connection_http") == "on"
 		next.TrueConnectionHTTPS = r.FormValue("true_connection_https") == "on"
+		err = applyTrueConnectionPortSelectionForm(&next, r.Form)
+		if err != nil {
+			data = a.pageData("配置", user, settingsForFailedForm(next, state.Settings))
+			data.Error = err.Error() + "。配置尚未保存。"
+			a.render(w, settingsTemplate, data)
+			return
+		}
 		if submitted := strings.TrimSpace(r.FormValue("true_connection_http_node")); submitted != "" {
 			next.TrueConnectionHTTPNode = submitted
 		}
@@ -3003,7 +3047,7 @@ func (a *App) collectFamilyResults(ctx context.Context, id string, settings Sett
 			if policy.ApplyLocationFilter {
 				stageGate = "地区、RTT 与带宽"
 			}
-			a.store.appendRunLog(id, "info", fmt.Sprintf("阶段 1 已完成：%s 通过%s门槛，已进入带宽候选池。开始阶段 2 真连接验证；将完整检测所选协议的全部 Cloudflare 端口。", result.IP, stageGate))
+			a.store.appendRunLog(id, "info", fmt.Sprintf("阶段 1 已完成：%s 通过%s门槛，已进入带宽候选池。开始阶段 2 真连接验证；只检测本轮已勾选的端口：%s。", result.IP, stageGate, strings.TrimPrefix(trueConnectionSummary(settings), "真连接:")))
 			ports, portAttempts, trueErr := runTrueConnectionTests(ctx, settings, result.IP)
 			if trueErr != nil {
 				return results, fmt.Errorf("IPv%d 真连接测试无法继续：%w", ipVersion, trueErr)
@@ -3468,6 +3512,22 @@ func validateTrueConnectionSettings(settings Settings) error {
 	if !settings.TrueConnectionHTTP && !settings.TrueConnectionHTTPS {
 		return errors.New("已启用真连接测试，请至少勾选 HTTP 或 HTTPS")
 	}
+	if settings.TrueConnectionHTTP && len(effectiveTrueConnectionPorts(settings.TrueConnectionHTTPPorts, trueConnectionHTTPPorts)) == 0 {
+		return errors.New("已启用 HTTP 真连接测试，请至少勾选一个 HTTP 端口")
+	}
+	if settings.TrueConnectionHTTPS && len(effectiveTrueConnectionPorts(settings.TrueConnectionHTTPSPorts, trueConnectionHTTPSPorts)) == 0 {
+		return errors.New("已启用 HTTPS 真连接测试，请至少勾选一个 HTTPS 端口")
+	}
+	if settings.TrueConnectionHTTP {
+		if err := validateSelectedTrueConnectionPorts("HTTP", settings.TrueConnectionHTTPPorts, trueConnectionHTTPPorts); err != nil {
+			return err
+		}
+	}
+	if settings.TrueConnectionHTTPS {
+		if err := validateSelectedTrueConnectionPorts("HTTPS", settings.TrueConnectionHTTPSPorts, trueConnectionHTTPSPorts); err != nil {
+			return err
+		}
+	}
 	if settings.TrueConnectionIPv4 && !settings.IPv4Enabled {
 		return errors.New("已启用 IPv4 真连接测试，但 IPv4 扫描没有启用")
 	}
@@ -3685,7 +3745,7 @@ func applyFamilyPolicyLabels(settings Settings, plan *RunSearchFamilyPlan) {
 		}
 	}
 	if policy.RunTrueConnection {
-		plan.TrueConnectPolicy = "执行该协议族已勾选的 HTTP/HTTPS 真连接"
+		plan.TrueConnectPolicy = "执行该协议族已勾选的真连接端口：" + strings.TrimPrefix(trueConnectionSummary(settings), "真连接:")
 	} else {
 		plan.TrueConnectPolicy = "不执行真连接"
 	}
@@ -3718,9 +3778,11 @@ func searchProfileForSettings(settings Settings, ipVersion int) searchmemory.Pro
 		profile.HTTPSEnabled = settings.TrueConnectionHTTPS
 		if profile.HTTPEnabled {
 			profile.HTTPNodeHash = searchmemory.SecretFingerprint(settings.TrueConnectionHTTPNode)
+			profile.HTTPPortSelection = trueConnectionProfilePortSelection(settings.TrueConnectionHTTPPorts, trueConnectionHTTPPorts)
 		}
 		if profile.HTTPSEnabled {
 			profile.HTTPSNodeHash = searchmemory.SecretFingerprint(settings.TrueConnectionHTTPSNode)
+			profile.HTTPSPortSelection = trueConnectionProfilePortSelection(settings.TrueConnectionHTTPSPorts, trueConnectionHTTPSPorts)
 		}
 	}
 	return profile
@@ -3913,24 +3975,9 @@ func runTrueConnectionTests(ctx context.Context, settings Settings, candidateIP 
 	if err != nil {
 		return nil, nil, err
 	}
-	variants := make([]trueConnectionVariant, 0, len(trueConnectionHTTPPorts)+len(trueConnectionHTTPSPorts))
-	if settings.TrueConnectionHTTP {
-		node, err := parseTrueConnectionNode(settings.TrueConnectionHTTPNode, false)
-		if err != nil {
-			return nil, nil, err
-		}
-		for _, port := range trueConnectionHTTPPorts {
-			variants = append(variants, trueConnectionVariant{Scheme: "HTTP", Port: port, Node: node})
-		}
-	}
-	if settings.TrueConnectionHTTPS {
-		node, err := parseTrueConnectionNode(settings.TrueConnectionHTTPSNode, true)
-		if err != nil {
-			return nil, nil, err
-		}
-		for _, port := range trueConnectionHTTPSPorts {
-			variants = append(variants, trueConnectionVariant{Scheme: "HTTPS", Port: port, Node: node})
-		}
+	variants, err := buildTrueConnectionVariants(settings)
+	if err != nil {
+		return nil, nil, err
 	}
 
 	type portOutcome struct {
@@ -3996,6 +4043,119 @@ func runTrueConnectionTests(ctx context.Context, settings Settings, candidateIP 
 		return attempts[i].Port < attempts[j].Port
 	})
 	return results, attempts, nil
+}
+
+func effectiveTrueConnectionPorts(selected, supported []int) []int {
+	if selected == nil {
+		return supported
+	}
+	return selected
+}
+
+func validateSelectedTrueConnectionPorts(scheme string, selected, supported []int) error {
+	allowed := make(map[int]bool, len(supported))
+	for _, port := range supported {
+		allowed[port] = true
+	}
+	seen := make(map[int]bool, len(selected))
+	for _, port := range effectiveTrueConnectionPorts(selected, supported) {
+		if !allowed[port] || seen[port] {
+			return fmt.Errorf("%s 真连接端口 %d 不受支持或重复", scheme, port)
+		}
+		seen[port] = true
+	}
+	return nil
+}
+
+func trueConnectionPortChoices(selected, supported []int) []TrueConnectionPortChoice {
+	chosen := make(map[int]bool, len(selected))
+	for _, port := range effectiveTrueConnectionPorts(selected, supported) {
+		chosen[port] = true
+	}
+	choices := make([]TrueConnectionPortChoice, 0, len(supported))
+	for _, port := range supported {
+		choices = append(choices, TrueConnectionPortChoice{Port: port, Checked: chosen[port]})
+	}
+	return choices
+}
+
+func trueConnectionProfilePortSelection(selected, supported []int) string {
+	if selected == nil || len(selected) == len(supported) {
+		return ""
+	}
+	chosen := make(map[int]bool, len(selected))
+	for _, port := range selected {
+		chosen[port] = true
+	}
+	parts := make([]string, 0, len(selected))
+	for _, port := range supported {
+		if chosen[port] {
+			parts = append(parts, strconv.Itoa(port))
+		}
+	}
+	return strings.Join(parts, ",")
+}
+
+func parseTrueConnectionPortForm(form url.Values, field string, supported []int) ([]int, error) {
+	allowed := make(map[int]bool, len(supported))
+	for _, port := range supported {
+		allowed[port] = true
+	}
+	chosen := make(map[int]bool, len(form[field]))
+	for _, raw := range form[field] {
+		port, err := strconv.Atoi(strings.TrimSpace(raw))
+		if err != nil || !allowed[port] {
+			return nil, fmt.Errorf("%s 包含不支持的端口 %q", field, raw)
+		}
+		chosen[port] = true
+	}
+	selected := make([]int, 0, len(chosen))
+	for _, port := range supported {
+		if chosen[port] {
+			selected = append(selected, port)
+		}
+	}
+	return selected, nil
+}
+
+func applyTrueConnectionPortSelectionForm(settings *Settings, form url.Values) error {
+	if _, present := form["true_connection_port_selection_ui"]; !present {
+		return nil // 兼容升级前已打开、尚无逐端口复选框的配置页。
+	}
+	httpPorts, err := parseTrueConnectionPortForm(form, "true_connection_http_ports", trueConnectionHTTPPorts)
+	if err != nil {
+		return err
+	}
+	httpsPorts, err := parseTrueConnectionPortForm(form, "true_connection_https_ports", trueConnectionHTTPSPorts)
+	if err != nil {
+		return err
+	}
+	settings.TrueConnectionHTTPPorts = httpPorts
+	settings.TrueConnectionHTTPSPorts = httpsPorts
+	return nil
+}
+
+func buildTrueConnectionVariants(settings Settings) ([]trueConnectionVariant, error) {
+	variants := make([]trueConnectionVariant, 0, len(trueConnectionHTTPPorts)+len(trueConnectionHTTPSPorts))
+	if settings.TrueConnectionHTTP {
+		node, err := parseTrueConnectionNode(settings.TrueConnectionHTTPNode, false)
+		if err != nil {
+			return nil, err
+		}
+		for _, port := range effectiveTrueConnectionPorts(settings.TrueConnectionHTTPPorts, trueConnectionHTTPPorts) {
+			variants = append(variants, trueConnectionVariant{Scheme: "HTTP", Port: port, Node: node})
+		}
+	}
+	if settings.TrueConnectionHTTPS {
+		node, err := parseTrueConnectionNode(settings.TrueConnectionHTTPSNode, true)
+		if err != nil {
+			return nil, err
+		}
+		for _, port := range effectiveTrueConnectionPorts(settings.TrueConnectionHTTPSPorts, trueConnectionHTTPSPorts) {
+			variants = append(variants, trueConnectionVariant{Scheme: "HTTPS", Port: port, Node: node})
+		}
+	}
+	return variants, nil
 }
 
 func classifyTrueConnectionError(err error) string {
@@ -5538,10 +5698,10 @@ func trueConnectionSummary(settings Settings) string {
 	}
 	var schemes []string
 	if settings.TrueConnectionHTTP {
-		schemes = append(schemes, "HTTP")
+		schemes = append(schemes, "HTTP:"+trueConnectionPortList(settings.TrueConnectionHTTPPorts, trueConnectionHTTPPorts))
 	}
 	if settings.TrueConnectionHTTPS {
-		schemes = append(schemes, "HTTPS")
+		schemes = append(schemes, "HTTPS:"+trueConnectionPortList(settings.TrueConnectionHTTPSPorts, trueConnectionHTTPSPorts))
 	}
 	return "真连接:" + strings.Join(families, "+") + "(" + strings.Join(schemes, "+") + ")"
 }
@@ -5666,6 +5826,8 @@ const layoutTemplate = `
     .muted { color: #6b7280; }
     .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
     .checkbox { display: flex; gap: 8px; align-items: center; margin-top: 14px; }
+    .port-choices { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+    .port-choices label { display: inline-flex; align-items: center; gap: 5px; margin: 0; padding: 6px 9px; border: 1px solid #dbe3ee; border-radius: 6px; background: white; font-size: 14px; }
     details { border: 1px solid #e5e7eb; border-radius: 8px; padding: 12px; margin-top: 10px; background: #fff; }
     summary { cursor: pointer; font-weight: 700; }
     pre.log { white-space: pre-wrap; overflow-wrap: anywhere; background: #0f172a; color: #e5e7eb; border-radius: 8px; padding: 12px; line-height: 1.5; max-height: 360px; overflow-y: auto; overscroll-behavior: contain; }
@@ -6142,6 +6304,7 @@ const settingsTemplate = `
 
     <div class="subsection" style="margin-top:22px">
       <h2>真连接测试（可选）</h2>
+	  <input type="hidden" name="true_connection_port_selection_ui" value="1">
       <p class="muted">这是节点协议的端到端可用性检查，不是带宽测速。系统会把扫描到的候选 IP 替换进你提供的节点，启动临时 Xray 核心并访问测试地址；只有至少一个所选端口真正响应的 IP 才会保留。</p>
       <div class="grid">
         <label class="metric checkbox">
@@ -6154,14 +6317,16 @@ const settingsTemplate = `
         </label>
       </div>
       <div class="grid">
-        <label class="metric checkbox">
-          <input type="checkbox" name="true_connection_http" {{if .Settings.TrueConnectionHTTP}}checked{{end}}>
-          <span><strong>测试 HTTP / 非 TLS</strong><br><span class="muted">完整测试端口：80、8080、8880、2052、2082、2086、2095。</span></span>
-        </label>
-        <label class="metric checkbox">
-          <input type="checkbox" name="true_connection_https" {{if .Settings.TrueConnectionHTTPS}}checked{{end}}>
-          <span><strong>测试 HTTPS / TLS</strong><br><span class="muted">完整测试端口：443、2053、2083、2087、2096、8443。</span></span>
-        </label>
+		<div class="metric">
+		  <label class="checkbox"><input type="checkbox" name="true_connection_http" {{if .Settings.TrueConnectionHTTP}}checked{{end}}><span><strong>测试 HTTP / 非 TLS</strong></span></label>
+		  <p class="muted">只尝试下面勾选的 HTTP 端口：</p>
+		  <div class="port-choices">{{range .TrueConnectionHTTPPortChoices}}<label><input type="checkbox" name="true_connection_http_ports" value="{{.Port}}" {{if .Checked}}checked{{end}}>{{.Port}}</label>{{end}}</div>
+		</div>
+		<div class="metric">
+		  <label class="checkbox"><input type="checkbox" name="true_connection_https" {{if .Settings.TrueConnectionHTTPS}}checked{{end}}><span><strong>测试 HTTPS / TLS</strong></span></label>
+		  <p class="muted">只尝试下面勾选的 HTTPS 端口：</p>
+		  <div class="port-choices">{{range .TrueConnectionHTTPSPortChoices}}<label><input type="checkbox" name="true_connection_https_ports" value="{{.Port}}" {{if .Checked}}checked{{end}}>{{.Port}}</label>{{end}}</div>
+		</div>
       </div>
       <div class="grid">
         <div>
@@ -6180,7 +6345,7 @@ const settingsTemplate = `
 	  <label>测试出口 / 运营商标签</label>
 	  <input type="text" name="search_network_label" value="{{.Settings.SearchNetworkLabel}}" maxlength="80" placeholder="213 VPS / 中国移动 / 广州电信">
 	  <p class="muted">这是分析标签，不改变网络路由。以后从不同 VPS 或运营商出口运行时，用不同标签即可分开比较端口成功率。</p>
-      <p class="muted">默认访问 Google <code>generate_204</code>。HTTP 和 HTTPS 会分别使用各自节点模板；系统会测完该协议组全部端口，并记录每个能通端口及真实响应延迟。连续 {{.FamilyNoResultLimit}} 没有获得合格 IP 时，沿用现有保护逻辑停止当前协议族并继续下一个协议族。</p>
+      <p class="muted">默认访问 Google <code>generate_204</code>。HTTP 和 HTTPS 分别使用各自节点模板；只测试启用协议组内勾选的端口，任意一个端口通过即保留 IP，并记录通过端口及真实响应延迟。连续 {{.FamilyNoResultLimit}} 没有获得合格 IP 时，沿用现有保护逻辑停止当前协议族并继续下一个协议族。</p>
     </div>
 	</details>
 

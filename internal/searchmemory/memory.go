@@ -25,19 +25,21 @@ type Store struct {
 }
 
 type Profile struct {
-	IPVersion     int
-	LocationMode  string
-	Country       string
-	Region        string
-	City          string
-	BandwidthMbps int
-	MaxRTTMs      int
-	HTTPEnabled   bool
-	HTTPNodeHash  string
-	HTTPSEnabled  bool
-	HTTPSNodeHash string
-	TestURL       string
-	NetworkLabel  string
+	IPVersion          int
+	LocationMode       string
+	Country            string
+	Region             string
+	City               string
+	BandwidthMbps      int
+	MaxRTTMs           int
+	HTTPEnabled        bool
+	HTTPNodeHash       string
+	HTTPPortSelection  string `json:"HTTPPortSelection,omitempty"`
+	HTTPSEnabled       bool
+	HTTPSNodeHash      string
+	HTTPSPortSelection string `json:"HTTPSPortSelection,omitempty"`
+	TestURL            string
+	NetworkLabel       string
 }
 
 type PortObservation struct {

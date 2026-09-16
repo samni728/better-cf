@@ -14,6 +14,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"cf-betterip-ser/internal/searchmemory"
 )
@@ -422,7 +423,7 @@ func TestScannerStageObservationsAreParsedAndHiddenFromUserLog(t *testing.T) {
 }
 
 func TestVersionAndRepositoryAreExposed(t *testing.T) {
-	if appVersion != "v1.3.4" || repositoryURL != "https://github.com/samni728/better-cf" {
+	if appVersion != "v1.3.5" || repositoryURL != "https://github.com/samni728/better-cf" {
 		t.Fatalf("version metadata = %s / %s", appVersion, repositoryURL)
 	}
 	if defaultSettings().SearchNetworkLabel != "213 VPS" {
@@ -1095,6 +1096,175 @@ func TestValidateTrueConnectionRequiresSeparateNodes(t *testing.T) {
 	settings.TrueConnectionHTTPSNode = "vless://uuid@104.17.1.1:443?security=tls&type=ws&host=tls.example.com&sni=tls.example.com&path=%2Fws"
 	if err := validateTrueConnectionSettings(settings); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestTrueConnectionOnlyBuildsSelectedHTTPSPort(t *testing.T) {
+	settings := defaultSettings()
+	settings.TrueConnectionHTTPS = true
+	settings.TrueConnectionHTTPSNode = "vless://uuid@104.17.1.1:8443?security=tls&type=ws&host=tls.example.com&sni=tls.example.com&path=%2Fws"
+	settings.TrueConnectionHTTPSPorts = []int{8443}
+	variants, err := buildTrueConnectionVariants(settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(variants) != 1 || variants[0].Scheme != "HTTPS" || variants[0].Port != 8443 {
+		t.Fatalf("selected HTTPS 8443 produced variants=%+v", variants)
+	}
+}
+
+func TestTrueConnectionRejectsEnabledProtocolWithNoSelectedPorts(t *testing.T) {
+	settings := defaultSettings()
+	settings.TrueConnectionIPv4 = true
+	settings.TrueConnectionHTTPS = true
+	settings.TrueConnectionHTTPSPorts = []int{}
+	settings.TrueConnectionHTTPSNode = "vless://uuid@104.17.1.1:8443?security=tls&type=ws&host=tls.example.com&sni=tls.example.com&path=%2Fws"
+	if err := validateTrueConnectionSettings(settings); err == nil {
+		t.Fatal("enabled HTTPS with zero selected ports was accepted")
+	}
+}
+
+func TestTrueConnectionPortFormPreservesOnlyCheckedPorts(t *testing.T) {
+	form := url.Values{"true_connection_https_ports": {"8443"}}
+	selected, err := parseTrueConnectionPortForm(form, "true_connection_https_ports", trueConnectionHTTPSPorts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(selected, []int{8443}) {
+		t.Fatalf("selected HTTPS ports=%v, want only 8443", selected)
+	}
+	selected, err = parseTrueConnectionPortForm(url.Values{}, "true_connection_https_ports", trueConnectionHTTPSPorts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selected == nil || len(selected) != 0 {
+		t.Fatalf("unchecked ports must be explicit empty selection, got %v", selected)
+	}
+}
+
+func TestSettingsPageShowsOnlySelectedHTTPSPortsChecked(t *testing.T) {
+	settings := defaultSettings()
+	settings.TrueConnectionHTTPSPorts = []int{8443}
+	data := (&App{}).pageData("配置", "admin", settings)
+	checked := make([]int, 0)
+	for _, choice := range data.TrueConnectionHTTPSPortChoices {
+		if choice.Checked {
+			checked = append(checked, choice.Port)
+		}
+	}
+	if !reflect.DeepEqual(checked, []int{8443}) {
+		t.Fatalf("checked HTTPS ports=%v, want only 8443", checked)
+	}
+	recorder := httptest.NewRecorder()
+	(&App{}).render(recorder, settingsTemplate, data)
+	html := recorder.Body.String()
+	if recorder.Code != http.StatusOK || !strings.Contains(html, `name="true_connection_https_ports" value="8443" checked`) || !strings.Contains(html, `name="true_connection_https_ports" value="443" >`) {
+		t.Fatalf("rendered form did not preserve 8443-only selection (status=%d)", recorder.Code)
+	}
+}
+
+func TestSelectedTrueConnectionPortsIsolateSearchMemoryProfile(t *testing.T) {
+	settings := defaultSettings()
+	settings.TrueConnectionIPv4 = true
+	settings.TrueConnectionHTTPS = true
+	settings.TrueConnectionHTTPSNode = "vless://uuid@104.17.1.1:8443?security=tls&type=ws&host=tls.example.com&sni=tls.example.com&path=%2Fws"
+	allPortsID, err := searchmemory.ProfileID(searchProfileForSettings(settings, 4))
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings.TrueConnectionHTTPSPorts = []int{8443}
+	only8443ID, err := searchmemory.ProfileID(searchProfileForSettings(settings, 4))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if allPortsID == only8443ID {
+		t.Fatal("8443-only profile reused historical all-port scan memory")
+	}
+	settings.TrueConnectionHTTPSPorts = append([]int{}, trueConnectionHTTPSPorts...)
+	fullExplicitID, err := searchmemory.ProfileID(searchProfileForSettings(settings, 4))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fullExplicitID != allPortsID {
+		t.Fatal("explicit all-port selection lost legacy historical profile")
+	}
+}
+
+func TestSearchMemoryProfileLabelsIdentifySelectedPorts(t *testing.T) {
+	memory, err := searchmemory.Open(t.TempDir() + "/search.sqlite")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer memory.Close()
+	settings := defaultSettings()
+	settings.TrueConnectionIPv4 = true
+	settings.TrueConnectionHTTPS = true
+	settings.TrueConnectionHTTPSNode = "vless://uuid@104.17.1.1:8443?security=tls&type=ws&host=tls.example.com&sni=tls.example.com&path=%2Fws"
+	if _, err := memory.EnsureProfile(context.Background(), searchProfileForSettings(settings, 4)); err != nil {
+		t.Fatal(err)
+	}
+	settings.TrueConnectionHTTPSPorts = []int{8443}
+	if _, err := memory.EnsureProfile(context.Background(), searchProfileForSettings(settings, 4)); err != nil {
+		t.Fatal(err)
+	}
+	views := (&App{searchMemory: memory}).searchMemoryProfileViews(settings, time.Now())
+	labels := make(map[string]bool)
+	for _, view := range views {
+		if view.Insight.Profile.IPVersion == 4 {
+			labels[view.ModeLabel] = true
+		}
+	}
+	if !labels["仅 HTTPS（全端口）"] || !labels["仅 HTTPS（8443）"] {
+		t.Fatalf("port-scoped profiles must have distinct visible labels: %+v", labels)
+	}
+}
+
+func TestFrozenRunPlanDisplaysSelectedPorts(t *testing.T) {
+	settings := defaultSettings()
+	settings.TrueConnectionIPv4 = true
+	settings.TrueConnectionHTTPS = true
+	settings.TrueConnectionHTTPSPorts = []int{8443}
+	plan := buildRunPlan(sanitizedRunSettings(settings))
+	if !strings.Contains(plan.TrueConnectionText, "HTTPS（8443）") || strings.Contains(plan.TrueConnectionText, "6 个端口") {
+		t.Fatalf("frozen plan hid selected ports: %q", plan.TrueConnectionText)
+	}
+	if !strings.Contains(trueConnectionSummary(settings), "HTTPS:8443") {
+		t.Fatalf("run summary hid selected ports: %q", trueConnectionSummary(settings))
+	}
+	family := RunSearchFamilyPlan{IPVersion: 4}
+	applyFamilyPolicyLabels(settings, &family)
+	if !strings.Contains(family.TrueConnectPolicy, "8443") {
+		t.Fatalf("family policy hid selected port: %q", family.TrueConnectPolicy)
+	}
+}
+
+func TestTrueConnectionRejectsUnsupportedSavedPort(t *testing.T) {
+	settings := defaultSettings()
+	settings.TrueConnectionIPv4 = true
+	settings.TrueConnectionHTTPS = true
+	settings.TrueConnectionHTTPSPorts = []int{8443, 22}
+	settings.TrueConnectionHTTPSNode = "vless://uuid@104.17.1.1:8443?security=tls&type=ws&host=tls.example.com&sni=tls.example.com&path=%2Fws"
+	if err := validateTrueConnectionSettings(settings); err == nil {
+		t.Fatal("unsupported saved port 22 was accepted")
+	}
+}
+
+func TestOldSettingsFormKeepsLegacyFullPortSelection(t *testing.T) {
+	settings := defaultSettings()
+	settings.TrueConnectionHTTPS = true
+	oldForm := url.Values{"true_connection_https": {"on"}}
+	if err := applyTrueConnectionPortSelectionForm(&settings, oldForm); err != nil {
+		t.Fatal(err)
+	}
+	if settings.TrueConnectionHTTPSPorts != nil {
+		t.Fatalf("old form changed legacy all-port selection: %v", settings.TrueConnectionHTTPSPorts)
+	}
+	newForm := url.Values{"true_connection_port_selection_ui": {"1"}, "true_connection_https": {"on"}}
+	if err := applyTrueConnectionPortSelectionForm(&settings, newForm); err != nil {
+		t.Fatal(err)
+	}
+	if settings.TrueConnectionHTTPSPorts == nil || len(settings.TrueConnectionHTTPSPorts) != 0 {
+		t.Fatalf("new form with no checked ports did not record explicit empty selection: %v", settings.TrueConnectionHTTPSPorts)
 	}
 }
 

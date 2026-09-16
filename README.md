@@ -1,12 +1,12 @@
 # Better CF
 
-[![Version](https://img.shields.io/badge/version-v1.3.4-2563eb)](VERSION)
+[![Version](https://img.shields.io/badge/version-v1.3.5-2563eb)](VERSION)
 [![GitHub](https://img.shields.io/badge/GitHub-samni728%2Fbetter--cf-111827?logo=github)](https://github.com/samni728/better-cf)
 [![Star](https://img.shields.io/github/stars/samni728/better-cf?style=social)](https://github.com/samni728/better-cf)
 
 Better CF 是一个基于 `better-cloudflare-ip` 的 Cloudflare 优选 IP 自动化项目。
 
-当前 `v1.3.4` 已把 WebUI 拆成执行中心、任务历史、IP 结果和项目配置四个工作区，并新增分阶段 SQLite 搜寻记忆。IPv4 与 IPv6 分别冻结候选来源、地区条件和真连接开关：某个协议族设置手动范围后，该协议族每批 100% 候选来自手动范围并暂停历史库存、全局池和地区过滤；另一个协议族仍保持自己的库存、地区与真连接策略。RTT 和带宽始终作为质量准入条件。
+当前 `v1.3.5` 已把 WebUI 拆成执行中心、任务历史、IP 结果和项目配置四个工作区，并新增分阶段 SQLite 搜寻记忆。IPv4 与 IPv6 分别冻结候选来源、地区条件和真连接开关：某个协议族设置手动范围后，该协议族每批 100% 候选来自手动范围并暂停历史库存、全局池和地区过滤；另一个协议族仍保持自己的库存、地区与真连接策略。RTT 和带宽始终作为质量准入条件。真连接现可逐端口勾选，仅测试所选端口。
 
 它的目标是：在当前 VPS / 本地网络环境中定期扫描速度更好的 Cloudflare IPv4 / IPv6 IP，保存测速结果，再把最终选出的 IP 批量同步到你自己的 Cloudflare 域名解析中。这样客户端只需要使用你的自定义优选域名，就能使用最新一轮筛选出来的 Cloudflare 优选 IP。
 
@@ -63,9 +63,9 @@ Better CF 是一个基于 `better-cloudflare-ip` 的 Cloudflare 优选 IP 自动
 
 - IPv4 与 IPv6 可以分别启用。
 - HTTP / 非 TLS 与 HTTPS / TLS 可以分别启用，并分别要求一条匹配的节点模板。
-- HTTP 完整检查 `80, 8080, 8880, 2052, 2082, 2086, 2095`。
-- HTTPS 完整检查 `443, 2053, 2083, 2087, 2096, 8443`。
-- 一个候选只要有一个所选端口真正返回 HTTP `2xx/3xx` 就能入选；系统仍会完成整个端口组并记录所有可用端口及各自响应延迟。
+- HTTP 可勾选 `80, 8080, 8880, 2052, 2082, 2086, 2095` 中需要测试的端口。
+- HTTPS 可勾选 `443, 2053, 2083, 2087, 2096, 8443` 中需要测试的端口。
+- 只尝试启用协议组内勾选的端口；一个候选只要有一个所选端口真正返回 HTTP `2xx/3xx` 就能入选，并记录每个通过端口及响应延迟。启用的协议组不能没有勾选端口。
 - 节点分享链接含 UUID 等敏感信息，只保存在当前 Settings，不复制到任务日志或任务配置快照。
 
 启用此功能时，VPS 需要安装官方 Xray-core，并可通过 `XRAY_BIN` 指定路径；默认也会查找 `/root/cf-betterip/xray`。
