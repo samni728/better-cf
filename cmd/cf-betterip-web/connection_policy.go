@@ -21,6 +21,12 @@ func requiredHTTPSPlanText(settings Settings) string {
 
 // A historical snapshot must not silently bypass the user's current port policy.
 func validateResumeConnectionPolicy(snapshot, current Settings) error {
+	if snapshot.TrueConnectionIPv4FullHTTPS != current.TrueConnectionIPv4FullHTTPS {
+		return fmt.Errorf("IPv4 HTTPS 全端口模式与原任务不同，请新建任务以使用当前准入规则")
+	}
+	if current.TrueConnectionIPv4FullHTTPS && snapshot.TrueConnectionIPv4MatrixFingerprint != ipv4MatrixFingerprint(current) {
+		return fmt.Errorf("IPv4 HTTPS 端口模板或验证规则与原任务不同，请新建任务以使用当前准入规则")
+	}
 	for _, family := range []int{4, 6} {
 		if trueConnectionEnabledForFamily(snapshot, family) != trueConnectionEnabledForFamily(current, family) {
 			return fmt.Errorf("IPv%d 真连接开关与原任务不同，请新建任务以使用当前准入规则", family)

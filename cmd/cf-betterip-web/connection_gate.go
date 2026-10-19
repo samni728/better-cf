@@ -11,12 +11,18 @@ func requiredHTTPSPortsForFamily(settings Settings, ipVersion int) []int {
 		return settings.TrueConnectionRequiredHTTPSPortsIPv6
 	}
 	if ipVersion == 4 {
+		if settings.TrueConnectionIPv4FullHTTPS {
+			return append([]int(nil), trueConnectionHTTPSPorts...)
+		}
 		return settings.TrueConnectionRequiredHTTPSPortsIPv4
 	}
 	return nil
 }
 
 func validateRequiredHTTPSSettings(settings Settings) error {
+	if err := validateIPv4MatrixSettings(settings); err != nil {
+		return err
+	}
 	for _, family := range []int{4, 6} {
 		required := requiredHTTPSPortsForFamily(settings, family)
 		if len(required) == 0 {
@@ -70,6 +76,11 @@ func validateResultTrueConnection(settings Settings, result IPTestResult) error 
 	}
 	if !trueConnectionEnabledForFamily(settings, family) {
 		return nil
+	}
+	if family == 4 && settings.TrueConnectionIPv4FullHTTPS {
+		if !result.IPv4DirectIngressVerified || result.IPv4MatrixFingerprint != ipv4MatrixFingerprint(settings) {
+			return fmt.Errorf("IP %s 缺少当前 IPv4 HTTPS 全端口模式的直连验证凭据，禁止准入", result.IP)
+		}
 	}
 	if !result.TrueConnectionTested {
 		return fmt.Errorf("IP %s 未完成真连接验证，禁止准入", result.IP)

@@ -71,10 +71,13 @@ type AdminConfig struct {
 }
 
 type Settings struct {
-	DNSConfigVersion      int                          `json:"dns_config_version,omitempty"`
-	CloudflareCredentials []CloudflareCredentialConfig `json:"cloudflare_credentials,omitempty"`
-	DNSTargets            []DNSTargetConfig            `json:"dns_targets,omitempty"`
-	ManualDNSTargets      []ManualDNSTargetConfig      `json:"manual_dns_targets,omitempty"`
+	TrueConnectionIPv4FullHTTPS         bool                         `json:"true_connection_ipv4_full_https,omitempty"`
+	TrueConnectionIPv4HTTPSNodes        map[string]string            `json:"true_connection_ipv4_https_nodes,omitempty"`
+	TrueConnectionIPv4MatrixFingerprint string                       `json:"true_connection_ipv4_matrix_fingerprint,omitempty"`
+	DNSConfigVersion                    int                          `json:"dns_config_version,omitempty"`
+	CloudflareCredentials               []CloudflareCredentialConfig `json:"cloudflare_credentials,omitempty"`
+	DNSTargets                          []DNSTargetConfig            `json:"dns_targets,omitempty"`
+	ManualDNSTargets                    []ManualDNSTargetConfig      `json:"manual_dns_targets,omitempty"`
 	// Legacy DNS fields are retained for one-way v1 -> v2 migration only.
 	CloudflareAPIToken                   string       `json:"cloudflare_api_token,omitempty"`
 	CloudflareAccountID                  string       `json:"cloudflare_account_id,omitempty"`
@@ -245,29 +248,31 @@ type RunLog struct {
 }
 
 type IPTestResult struct {
-	RunID                   string                     `json:"run_id"`
-	IP                      string                     `json:"ip"`
-	IPVersion               int                        `json:"ip_version"`
-	RecordType              string                     `json:"record_type"`
-	Protocol                string                     `json:"protocol"`
-	ConfiguredBandwidthMbps int                        `json:"configured_bandwidth_mbps"`
-	MeasuredBandwidthMbps   int                        `json:"measured_bandwidth_mbps"`
-	PeakSpeedKBps           int                        `json:"peak_speed_kbps"`
-	RTTMs                   int                        `json:"rtt_ms"`
-	TrueConnectionTested    bool                       `json:"true_connection_tested,omitempty"`
-	TrueConnectionPorts     []TrueConnectionPortResult `json:"true_connection_ports,omitempty"`
-	CandidateSource         string                     `json:"candidate_source,omitempty"`
-	DataCenter              string                     `json:"data_center"`
-	DataCenterCode          string                     `json:"data_center_code,omitempty"`
-	DataCenterCountry       string                     `json:"data_center_country,omitempty"`
-	DataCenterRegion        string                     `json:"data_center_region,omitempty"`
-	DataCenterCity          string                     `json:"data_center_city,omitempty"`
-	DurationSeconds         int                        `json:"duration_seconds"`
-	SelectedForDNS          bool                       `json:"selected_for_dns"`
-	CloudflareSynced        bool                       `json:"cloudflare_synced"`
-	ConfirmedDNSTargets     int                        `json:"confirmed_dns_targets,omitempty"`
-	PlannedDNSTargets       int                        `json:"planned_dns_targets,omitempty"`
-	TestedAt                string                     `json:"tested_at"`
+	IPv4MatrixFingerprint     string                     `json:"ipv4_matrix_fingerprint,omitempty"`
+	IPv4DirectIngressVerified bool                       `json:"ipv4_direct_ingress_verified,omitempty"`
+	RunID                     string                     `json:"run_id"`
+	IP                        string                     `json:"ip"`
+	IPVersion                 int                        `json:"ip_version"`
+	RecordType                string                     `json:"record_type"`
+	Protocol                  string                     `json:"protocol"`
+	ConfiguredBandwidthMbps   int                        `json:"configured_bandwidth_mbps"`
+	MeasuredBandwidthMbps     int                        `json:"measured_bandwidth_mbps"`
+	PeakSpeedKBps             int                        `json:"peak_speed_kbps"`
+	RTTMs                     int                        `json:"rtt_ms"`
+	TrueConnectionTested      bool                       `json:"true_connection_tested,omitempty"`
+	TrueConnectionPorts       []TrueConnectionPortResult `json:"true_connection_ports,omitempty"`
+	CandidateSource           string                     `json:"candidate_source,omitempty"`
+	DataCenter                string                     `json:"data_center"`
+	DataCenterCode            string                     `json:"data_center_code,omitempty"`
+	DataCenterCountry         string                     `json:"data_center_country,omitempty"`
+	DataCenterRegion          string                     `json:"data_center_region,omitempty"`
+	DataCenterCity            string                     `json:"data_center_city,omitempty"`
+	DurationSeconds           int                        `json:"duration_seconds"`
+	SelectedForDNS            bool                       `json:"selected_for_dns"`
+	CloudflareSynced          bool                       `json:"cloudflare_synced"`
+	ConfirmedDNSTargets       int                        `json:"confirmed_dns_targets,omitempty"`
+	PlannedDNSTargets         int                        `json:"planned_dns_targets,omitempty"`
+	TestedAt                  string                     `json:"tested_at"`
 }
 
 type scannerStageObservation struct {
@@ -994,6 +999,12 @@ func (s *Store) snapshot() AppState {
 
 func cloneSettings(settings Settings) Settings {
 	cloned := settings
+	if settings.TrueConnectionIPv4HTTPSNodes != nil {
+		cloned.TrueConnectionIPv4HTTPSNodes = make(map[string]string, len(settings.TrueConnectionIPv4HTTPSNodes))
+		for port, node := range settings.TrueConnectionIPv4HTTPSNodes {
+			cloned.TrueConnectionIPv4HTTPSNodes[port] = node
+		}
+	}
 	cloned.CloudflareCredentials = append([]CloudflareCredentialConfig(nil), settings.CloudflareCredentials...)
 	cloned.DNSTargets = append([]DNSTargetConfig(nil), settings.DNSTargets...)
 	cloned.ManualDNSTargets = append([]ManualDNSTargetConfig(nil), settings.ManualDNSTargets...)
@@ -1039,6 +1050,10 @@ func sanitizedRunSettings(settings Settings) Settings {
 	snapshot.ManualDNSTargets = nil
 	snapshot.TrueConnectionHTTPNode = ""
 	snapshot.TrueConnectionHTTPSNode = ""
+	snapshot.TrueConnectionIPv4HTTPSNodes = nil
+	if settings.TrueConnectionIPv4FullHTTPS {
+		snapshot.TrueConnectionIPv4MatrixFingerprint = ipv4MatrixFingerprint(settings)
+	}
 	return snapshot
 }
 
@@ -1057,11 +1072,13 @@ func hydrateRunSettings(snapshot Settings, current Settings) Settings {
 	// 节点分享链接包含 UUID 等敏感信息，不写入任务快照；续接时按当前已保存配置解析。
 	hydrated.TrueConnectionHTTPNode = current.TrueConnectionHTTPNode
 	hydrated.TrueConnectionHTTPSNode = current.TrueConnectionHTTPSNode
+	hydrated.TrueConnectionIPv4HTTPSNodes = cloneSettings(current).TrueConnectionIPv4HTTPSNodes
 	return hydrated
 }
 
 func settingsForFailedForm(candidate Settings, persisted Settings) Settings {
 	safe := cloneSettings(candidate)
+	safe.TrueConnectionIPv4HTTPSNodes = cloneSettings(persisted).TrueConnectionIPv4HTTPSNodes
 	persistedCredentials := make(map[string]CloudflareCredentialConfig, len(persisted.CloudflareCredentials))
 	for _, credential := range persisted.CloudflareCredentials {
 		persistedCredentials[credential.ID] = credential
@@ -2357,6 +2374,7 @@ func (a *App) settings(w http.ResponseWriter, r *http.Request) {
 		if submitted := strings.TrimSpace(r.FormValue("true_connection_https_node")); submitted != "" {
 			next.TrueConnectionHTTPSNode = submitted
 		}
+		applyIPv4MatrixForm(&next, r.Form)
 		next.TrueConnectionTestURL = strings.TrimSpace(r.FormValue("true_connection_test_url"))
 		if next.TrueConnectionTestURL == "" {
 			next.TrueConnectionTestURL = "https://www.google.com/generate_204"
@@ -2798,6 +2816,18 @@ func (a *App) executeRunWithSeed(id string, settings Settings, trigger, sourceRu
 			if len(results) >= required || seen[item.IP] {
 				continue
 			}
+
+			if item.IPVersion == 4 && settings.TrueConnectionIPv4FullHTTPS {
+				a.store.appendRunLog(id, "info", fmt.Sprintf("续接 IPv4 %s：重新验证当前直连出口与六端口双轮链路。", item.IP))
+				if err := refreshIPv4MatrixSeed(ctx, settings, &item, runTrueConnectionTests); err != nil {
+					if ctx.Err() != nil {
+						a.finishRunFromError(id, ctx.Err())
+						return
+					}
+					a.store.appendRunLog(id, "warn", fmt.Sprintf("续接 IPv4 %s 重新验证失败，继续搜索。", item.IP))
+					continue
+				}
+			}
 			if err := validateResultTrueConnection(settings, item); err != nil {
 				a.store.appendRunLog(id, "warn", fmt.Sprintf("续接结果 %s 未满足当前端口准入，重新搜索：%v", item.IP, err))
 				continue
@@ -3074,6 +3104,10 @@ func (a *App) collectFamilyResults(ctx context.Context, id string, settings Sett
 			a.store.appendRunLog(id, "info", "端口诊断："+formatTrueConnectionAttempts(portAttempts))
 			result.TrueConnectionTested = true
 			result.TrueConnectionPorts = ports
+			if ipVersion == 4 && settings.TrueConnectionIPv4FullHTTPS && len(ports) == len(trueConnectionHTTPSPorts) {
+				result.IPv4DirectIngressVerified = true
+				result.IPv4MatrixFingerprint = ipv4MatrixFingerprint(settings)
+			}
 			gateErr := validateResultTrueConnection(settings, result)
 			outcome := "true_success"
 			errorClass := ""
@@ -3568,7 +3602,7 @@ func validateTrueConnectionSettings(settings Settings) error {
 			return fmt.Errorf("HTTP 真连接节点不可用：%w", err)
 		}
 	}
-	if settings.TrueConnectionHTTPS {
+	if settings.TrueConnectionHTTPS && (!settings.TrueConnectionIPv4FullHTTPS || settings.TrueConnectionIPv6) {
 		if _, err := parseTrueConnectionNode(settings.TrueConnectionHTTPSNode, true); err != nil {
 			return fmt.Errorf("HTTPS 真连接节点不可用：%w", err)
 		}
@@ -3811,6 +3845,9 @@ func searchProfileForSettings(settings Settings, ipVersion int) searchmemory.Pro
 		}
 		if profile.HTTPSEnabled {
 			profile.HTTPSNodeHash = searchmemory.SecretFingerprint(settings.TrueConnectionHTTPSNode)
+			if ipVersion == 4 && settings.TrueConnectionIPv4FullHTTPS {
+				profile.HTTPSNodeHash = ipv4MatrixFingerprint(settings)
+			}
 			profile.HTTPSPortSelection = trueConnectionProfilePortSelection(settings.TrueConnectionHTTPSPorts, trueConnectionHTTPSPorts)
 			profile.RequiredHTTPSPorts = trueConnectionPortList(requiredHTTPSPortsForFamily(settings, ipVersion), nil)
 		}
@@ -4005,9 +4042,19 @@ func runTrueConnectionTests(ctx context.Context, settings Settings, candidateIP 
 	if err != nil {
 		return nil, nil, err
 	}
-	variants, err := buildTrueConnectionVariants(settings)
+	family := 6
+	if address := net.ParseIP(candidateIP); address == nil {
+		return nil, nil, errors.New("候选 IP 无效")
+	} else if address.To4() != nil {
+		family = 4
+	}
+	variants, err := buildTrueConnectionVariantsForFamily(settings, family)
 	if err != nil {
 		return nil, nil, err
+	}
+
+	if family == 4 && settings.TrueConnectionIPv4FullHTTPS {
+		return runIPv4MatrixTests(ctx, settings, candidateIP, variants, xrayBin, verifyIPv4DirectIngress, testStrictTrueConnectionPort)
 	}
 
 	type portOutcome struct {
@@ -4236,6 +4283,14 @@ func formatTrueConnectionAttempts(attempts []trueConnectionPortAttempt) string {
 }
 
 func testTrueConnectionPort(parent context.Context, xrayBin string, node trueConnectionNode, candidateIP string, port int, testURL string) (int, error) {
+	return testTrueConnectionPortWithPolicy(parent, xrayBin, node, candidateIP, port, testURL, false)
+}
+
+func testStrictTrueConnectionPort(parent context.Context, xrayBin string, node trueConnectionNode, candidateIP string, port int, testURL string) (int, error) {
+	return testTrueConnectionPortWithPolicy(parent, xrayBin, node, candidateIP, port, testURL, true)
+}
+
+func testTrueConnectionPortWithPolicy(parent context.Context, xrayBin string, node trueConnectionNode, candidateIP string, port int, testURL string, strict bool) (int, error) {
 	ctx, cancel := context.WithTimeout(parent, 12*time.Second)
 	defer cancel()
 	localPort, releaseLocalPort, err := reserveTrueConnectionLocalPort()
@@ -4298,6 +4353,9 @@ func testTrueConnectionPort(parent context.Context, xrayBin string, node trueCon
 	}
 	defer transport.CloseIdleConnections()
 	client := &http.Client{Transport: transport}
+	if strict {
+		client.CheckRedirect = func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }
+	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, testURL, nil)
 	if err != nil {
 		return 0, err
@@ -4309,9 +4367,11 @@ func testTrueConnectionPort(parent context.Context, xrayBin string, node trueCon
 		return 0, err
 	}
 	defer response.Body.Close()
-	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 64*1024))
+	if _, err := io.Copy(io.Discard, io.LimitReader(response.Body, 64*1024)); err != nil && strict {
+		return 0, fmt.Errorf("读取测试响应失败: %w", err)
+	}
 	latency := int(time.Since(startedAt).Milliseconds())
-	if response.StatusCode < 200 || response.StatusCode >= 400 {
+	if response.StatusCode < 200 || response.StatusCode >= 400 || (strict && response.StatusCode >= 300) {
 		return latency, fmt.Errorf("测试地址返回 HTTP %d", response.StatusCode)
 	}
 	return latency, nil
@@ -6373,6 +6433,15 @@ const settingsTemplate = `
 		  <div class="port-choices">{{range .TrueConnectionHTTPSPortChoices}}<label><input type="checkbox" name="true_connection_https_ports" value="{{.Port}}" {{if .Checked}}checked{{end}}>{{.Port}}</label>{{end}}</div>
 		</div>
       </div>
+      <input type="hidden" name="true_connection_ipv4_matrix_ui" value="1">
+      <label class="checkbox"><input type="checkbox" name="true_connection_ipv4_full_https" {{if .Settings.TrueConnectionIPv4FullHTTPS}}checked{{end}}>IPv4 六端口严格验证（中国大陆直连）</label>
+      <p class="muted">开启后须同时启用 IPv4 真连接、HTTPS 和六个测试端口。逐端口检查固定 IP 的直连出口（中国大陆、WARP 关闭），再用各自节点串行验证两次；六端口全部通过才允许发布。IPv6 沿用原流程。网关需让测试设备到 CF 的这些端口直连。</p>
+      <div class="grid">{{range .TrueConnectionHTTPSPortChoices}}
+       <div><label>IPv4 HTTPS {{.Port}} 专用节点模板</label>
+        <textarea name="true_connection_ipv4_https_node_{{.Port}}" rows="2" placeholder="留空保留已保存模板；未配置则使用公共 HTTPS 模板"></textarea>
+        <span class="muted">{{if index $.Settings.TrueConnectionIPv4HTTPSNodes (printf "%d" .Port)}}专用模板已保存，不回显凭据。{{else}}使用公共 HTTPS 模板。{{end}}</span>
+        <label class="checkbox"><input type="checkbox" name="true_connection_ipv4_https_clear_{{.Port}}">清除此端口专用模板</label>
+       </div>{{end}}</div>
       <input type="hidden" name="true_connection_required_ports_ui" value="1">
       <div class="grid">
        <div class="metric"><strong>IPv4 必须通过的 HTTPS 端口</strong>
@@ -6382,7 +6451,7 @@ const settingsTemplate = `
         <div class="port-choices">{{range .RequiredHTTPSPortChoicesIPv6}}<label><input type="checkbox" name="true_connection_required_https_ports_ipv6" value="{{.Port}}" {{if .Checked}}checked{{end}}>{{.Port}}</label>{{end}}</div>
        </div>
       </div>
-      <p class="muted">请选择客户端实际使用的端口，例如 IPv4 8443、IPv6 2087。必需端口须同时在上方 HTTPS 测试端口中勾选，并启用对应 IP 版本的真连接和 HTTPS 测试。未验证或缺少任一必需端口的 IP 禁止写入 DNS；所有发布地址都必须达标。</p>
+      <p class="muted">使用共享优选域名时，建议开启 IPv4 六端口严格验证；下面的自定义必需端口用于其他模式。必需端口须同时在上方 HTTPS 测试端口中勾选，并启用对应 IP 版本的真连接和 HTTPS 测试。未验证或缺少任一必需端口的 IP 禁止写入 DNS；所有发布地址都必须达标。</p>
       {{if not .Settings.TrueConnectionIPv4}}<p class="muted">IPv4 真连接当前关闭：测速结果无法证明 IPv4 节点可用。</p>{{end}}
       {{if not .Settings.TrueConnectionIPv6}}<p class="muted">IPv6 真连接当前关闭：测速结果无法证明 IPv6 节点可用。</p>{{end}}
       <div class="grid">
