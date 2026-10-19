@@ -38,6 +38,7 @@ type Profile struct {
 	HTTPSEnabled       bool
 	HTTPSNodeHash      string
 	HTTPSPortSelection string `json:"HTTPSPortSelection,omitempty"`
+	RequiredHTTPSPorts string `json:"RequiredHTTPSPorts,omitempty"`
 	TestURL            string
 	NetworkLabel       string
 }
