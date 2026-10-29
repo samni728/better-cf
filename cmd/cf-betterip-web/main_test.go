@@ -887,7 +887,12 @@ func TestSyncResultsContinuesAfterIndependentTargetPreflightFailure(t *testing.T
 		}
 		return jsonHTTPResponse(http.StatusNotFound, `{"success":false,"errors":[{"message":"unexpected request"}]}`), nil
 	})
-	t.Cleanup(func() { http.DefaultTransport = originalTransport })
+	originalDedicatedTransport := cloudflareDedicatedClient.Transport
+	cloudflareDedicatedClient.Transport = http.DefaultTransport
+	t.Cleanup(func() {
+		http.DefaultTransport = originalTransport
+		cloudflareDedicatedClient.Transport = originalDedicatedTransport
+	})
 
 	credential := CloudflareCredentialConfig{ID: "credential-main", Name: "Main", AuthType: "api_token", APIToken: "token"}
 	settings := defaultSettings()

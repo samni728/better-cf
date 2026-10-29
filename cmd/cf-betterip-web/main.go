@@ -5261,7 +5261,12 @@ func cloudflareRequest(client *http.Client, method, url string, credential Cloud
 		req.Header.Set("Authorization", "Bearer "+credential.APIToken)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := client.Do(req)
+	// Keep this DNS/direct transport strictly scoped to Cloudflare API; leave all
+	// six-port scanner and other HTTPS traffic unchanged.
+	if strings.EqualFold(req.URL.Hostname(), "api.cloudflare.com") && client.Transport == nil {
+		client = cloudflareDedicatedClient
+	}
+	resp, err := doCloudflareRequest(client, req)
 	if err != nil {
 		return err
 	}
